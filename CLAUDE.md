@@ -74,6 +74,7 @@ cargo test --workspace --doc
 cargo deny check
 cargo audit
 cargo bench -p <changed hot-path crate>   # when the hot path changed
+cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60   # when a decoder changed
 ```
 
 A change is done when:
