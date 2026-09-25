@@ -7,13 +7,15 @@
 //! - [`handshake`]: the HTTP upgrade request and strict validation of the server's reply.
 //! - [`frame`]: frame header parsing and client frame encoding (client frames are masked).
 //! - [`reader`]: turns received bytes into events, borrowing message payloads from its buffer.
+//! - [`client`]: ties the above to a network [`Stream`](crate::net::Stream) with non-blocking reads.
 //!
-//! The transport (TCP + TLS) lives elsewhere and only moves bytes in and out. Everything here
-//! is pure and fuzzed.
+//! The transport (TCP + TLS) lives in [`crate::net`] and only moves bytes. Everything except
+//! `client` is pure and fuzzed.
 //!
 //! Extensions and subprotocols are never negotiated, so compressed or reserved-bit frames are
 //! protocol errors.
 
+pub mod client;
 pub mod frame;
 pub mod handshake;
 pub mod reader;
