@@ -41,6 +41,36 @@ fn pow10(n: u8) -> Result<i128, FixedError> {
         .ok_or(FixedError::ScaleTooLarge)
 }
 
+/// `10^n` for `n` in `0..=18`, the range that fits in an `i64`, for the fast paths.
+// Indexing runs only during const evaluation: an out-of-bounds index fails the build.
+#[allow(clippy::indexing_slicing)]
+const POW10_I64: [i64; 19] = {
+    let mut table = [1_i64; 19];
+    let mut i = 1;
+    while i < table.len() {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
+/// `value * 10 + digit`, checked.
+fn accumulate(value: i128, digit: u8) -> Result<i128, FixedError> {
+    value
+        .checked_mul(10)
+        .and_then(|v| v.checked_add(i128::from(digit)))
+        .ok_or(FixedError::Overflow)
+}
+
+/// Applies `rounding` to a floor quotient, given whether the division was exact.
+fn round_quotient(floor: i128, exact: bool, rounding: Rounding) -> Result<i128, FixedError> {
+    match (rounding, exact) {
+        (_, true) | (Rounding::Down, false) => Ok(floor),
+        (Rounding::Up, false) => floor.checked_add(1).ok_or(FixedError::Overflow),
+        (Rounding::Exact, false) => Err(FixedError::NotMultiple),
+    }
+}
+
 /// Errors from parsing, converting or formatting fixed-point numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FixedError {
@@ -149,7 +179,9 @@ impl Dec {
             Some(_) => (false, 0),
         };
 
-        let mut mantissa: i128 = 0;
+        // Accumulate in a u64 (fast), switching to i128 only for numbers that need it.
+        let mut small: u64 = 0;
+        let mut big: Option<i128> = None;
         let mut scale: u8 = 0;
         let mut seen_point = false;
         let mut int_digits = 0_usize;
@@ -157,10 +189,17 @@ impl Dec {
         for (pos, &byte) in bytes.iter().enumerate().skip(digits_start) {
             match byte {
                 b'0'..=b'9' => {
-                    mantissa = mantissa
-                        .checked_mul(10)
-                        .and_then(|m| m.checked_add(i128::from(byte.wrapping_sub(b'0'))))
-                        .ok_or(FixedError::Overflow)?;
+                    let digit = byte.wrapping_sub(b'0');
+                    match big {
+                        None => match small
+                            .checked_mul(10)
+                            .and_then(|m| m.checked_add(u64::from(digit)))
+                        {
+                            Some(next) => small = next,
+                            None => big = Some(accumulate(i128::from(small), digit)?),
+                        },
+                        Some(value) => big = Some(accumulate(value, digit)?),
+                    }
                     if seen_point {
                         scale = scale.saturating_add(1);
                         if scale > MAX_PARSE_SCALE {
@@ -182,6 +221,7 @@ impl Dec {
             // Trailing point with no fractional digits, e.g. "12."
             return Err(FixedError::InvalidChar(bytes.len().saturating_sub(1)));
         }
+        let mut mantissa = big.unwrap_or(i128::from(small));
         if negative {
             mantissa = mantissa.checked_neg().ok_or(FixedError::Overflow)?;
         }
@@ -382,21 +422,95 @@ impl Increment {
     /// [`FixedError::Overflow`] if the result does not fit in an `i64`.
     pub fn to_units(self, value: Dec, rounding: Rounding) -> Result<i64, FixedError> {
         let common = value.scale.max(self.scale);
+        // Fast path: venue numbers almost always fit in 64 bits, and 64-bit division is several
+        // times cheaper than 128-bit division.
+        if let Some((numerator, denominator)) = self.rescaled_i64(value, common) {
+            // `denominator` is strictly positive, so Euclidean division is floor division.
+            let floor = numerator
+                .checked_div_euclid(denominator)
+                .ok_or(FixedError::Overflow)?;
+            let exact = numerator.checked_rem_euclid(denominator) == Some(0);
+            let units = round_quotient(i128::from(floor), exact, rounding)?;
+            return i64::try_from(units).map_err(|_| FixedError::Overflow);
+        }
         let numerator = value.mantissa_at(common)?;
         let denominator = self.as_dec().mantissa_at(common)?;
-        // `denominator` is strictly positive, so Euclidean division is floor division.
         let floor = numerator
             .checked_div_euclid(denominator)
             .ok_or(FixedError::Overflow)?;
-        let remainder = numerator
-            .checked_rem_euclid(denominator)
-            .ok_or(FixedError::Overflow)?;
-        let units = match (rounding, remainder == 0) {
-            (_, true) | (Rounding::Down, false) => floor,
-            (Rounding::Up, false) => floor.checked_add(1).ok_or(FixedError::Overflow)?,
-            (Rounding::Exact, false) => return Err(FixedError::NotMultiple),
-        };
+        let exact = numerator.checked_rem_euclid(denominator) == Some(0);
+        let units = round_quotient(floor, exact, rounding)?;
         i64::try_from(units).map_err(|_| FixedError::Overflow)
+    }
+
+    /// Numerator and denominator at scale `common`, if both fit in an `i64`.
+    fn rescaled_i64(self, value: Dec, common: u8) -> Option<(i64, i64)> {
+        let factor = |scale: u8| {
+            POW10_I64
+                .get(usize::from(common.checked_sub(scale)?))
+                .copied()
+        };
+        let numerator = i64::try_from(value.mantissa)
+            .ok()?
+            .checked_mul(factor(value.scale)?)?;
+        let denominator = self.mantissa.checked_mul(factor(self.scale)?)?;
+        Some((numerator, denominator))
+    }
+
+    /// Parses decimal text straight into whole increments. Same result, and same errors, as
+    /// `self.to_units(Dec::parse(text)?, rounding)`, but faster for venue data.
+    ///
+    /// For power-of-ten increments (tick sizes like `0.01`) and text that is already an exact
+    /// multiple, which is nearly all venue data, it only checks that the digits past the
+    /// increment's decimal place are zeros: no division. Everything else takes the general path.
+    ///
+    /// # Errors
+    /// As [`Dec::parse`] and [`Increment::to_units`].
+    pub fn parse_units(self, text: &str, rounding: Rounding) -> Result<i64, FixedError> {
+        if let Some(units) = self.parse_exact_power_of_ten(text) {
+            return Ok(units);
+        }
+        self.to_units(Dec::parse(text)?, rounding)
+    }
+
+    /// The division-free fast path of [`parse_units`](Self::parse_units). `None` means "not
+    /// handled here", never an error.
+    fn parse_exact_power_of_ten(self, text: &str) -> Option<i64> {
+        if self.mantissa != 1 {
+            return None;
+        }
+        // Work on bytes: splitting a `str` inside a multi-byte character would panic.
+        let bytes = text.as_bytes();
+        let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
+            Some(dot) => {
+                let (int, rest) = bytes.split_at(dot);
+                let frac = rest.get(1..)?;
+                if frac.is_empty() {
+                    return None;
+                }
+                (int, frac)
+            }
+            None => (bytes, &[][..]),
+        };
+        let wanted = usize::from(self.scale);
+        if int_part.is_empty() || frac_part.len() > usize::from(MAX_PARSE_SCALE) {
+            return None;
+        }
+        let (kept, dropped) = frac_part.split_at(frac_part.len().min(wanted));
+        if !dropped.iter().all(|&b| b == b'0') {
+            return None; // Not an exact multiple (or malformed): let the general path decide.
+        }
+        let mut units: i64 = 0;
+        for &byte in int_part.iter().chain(kept) {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            units = units
+                .checked_mul(10)?
+                .checked_add(i64::from(byte.wrapping_sub(b'0')))?;
+        }
+        let missing = wanted.saturating_sub(kept.len());
+        units.checked_mul(*POW10_I64.get(missing)?)
     }
 
     /// The decimal value of `units` whole increments. Always exact.
@@ -518,6 +632,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_units_fast_and_general_paths_agree_on_edge_cases() {
+        let tick = Increment::parse("0.01").unwrap();
+        for text in [
+            "84000.01000000",
+            "84000.01",
+            "84000",
+            "0.00",
+            "84000.015",
+            "84000.",
+            ".5",
+            "-1.00",
+            "1e2",
+            "",
+            "99999999999999999999.00",
+            "0.0000000000000000000",
+        ] {
+            let general = Dec::parse(text).and_then(|d| tick.to_units(d, Rounding::Exact));
+            assert_eq!(tick.parse_units(text, Rounding::Exact), general, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_units_rejects_non_ascii_without_panicking() {
+        // Regression: found by fuzzing. Splitting inside a multi-byte character panicked.
+        let tick = Increment::parse("0.01").unwrap();
+        for text in ["84735.\u{4e4}0", "1.0\u{12b}", "\u{12b}.00", "8.\u{1f600}"] {
+            let general = Dec::parse(text).and_then(|d| tick.to_units(d, Rounding::Exact));
+            assert!(general.is_err());
+            assert_eq!(tick.parse_units(text, Rounding::Exact), general, "{text:?}");
+        }
+    }
+
+    #[test]
     fn reports_unit_overflow() {
         let tick = Increment::parse("0.000000000000000001").unwrap();
         assert_eq!(
@@ -555,6 +702,32 @@ mod tests {
             prop_assert!(inc.from_units(up) >= value);
             prop_assert!(up - down <= 1);
             prop_assert_eq!(up == down, inc.to_units(value, Rounding::Exact).is_ok());
+        }
+
+        #[test]
+        fn parse_units_matches_general_path(
+            int in 0_u64..1_000_000_000,
+            frac in "[0-9]{0,20}",
+            with_point in any::<bool>(),
+            scale in 0_u8..=12,
+            mantissa in prop_oneof![Just(1_i64), 1_i64..100],
+            rounding in prop_oneof![Just(Rounding::Down), Just(Rounding::Up), Just(Rounding::Exact)],
+        ) {
+            let text = if with_point { format!("{int}.{frac}") } else { int.to_string() };
+            let inc = Increment::new(mantissa, scale).unwrap();
+            let general = Dec::parse(&text).and_then(|d| inc.to_units(d, rounding));
+            prop_assert_eq!(inc.parse_units(&text, rounding), general, "{} with {}", text, inc);
+        }
+
+        #[test]
+        fn parse_units_matches_general_path_on_any_text(
+            text in "\\PC{0,24}",
+            scale in 0_u8..=8,
+            rounding in prop_oneof![Just(Rounding::Down), Just(Rounding::Up), Just(Rounding::Exact)],
+        ) {
+            let inc = Increment::new(1, scale).unwrap();
+            let general = Dec::parse(&text).and_then(|d| inc.to_units(d, rounding));
+            prop_assert_eq!(inc.parse_units(&text, rounding), general);
         }
 
         #[test]

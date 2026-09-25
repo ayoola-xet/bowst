@@ -71,6 +71,30 @@ jobs:
       - run: "cargo +nightly miri test -p bowst-core --lib -- ring::"
       - run: cargo +nightly miri test -p bowst-core --test no_alloc
 
+  fuzz:
+    # Short fuzzing run of every target on every PR. Malformed venue data must return an
+    # error, never panic (CLAUDE.md §4). Seeds are real recorded messages in fuzz/seeds/.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz each target for 60 seconds
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            mkdir -p "fuzz/corpus/$target"
+            # Explicit target: the prebuilt cargo-fuzz binary defaults to its own (musl) target.
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu \
+              "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" \
+              -- -max_total_time=60
+          done
+
   supply-chain:
     runs-on: ubuntu-24.04
     steps:

@@ -8,6 +8,7 @@ Each significant architecture decision gets one short record here, numbered in o
 | [0002](0002-fixed-point-money.md) | Fixed-point integers for prices and quantities | Accepted |
 | [0003](0003-spsc-rings-between-threads.md) | Lock-free SPSC rings as the only hot-path channel | Accepted |
 | [0004](0004-order-book-representation.md) | Order book as a sorted array with the best level last | Accepted |
+| [0005](0005-json-decoding.md) | In-house allocation-free JSON reader for venue messages | Accepted |
 
 ## Template
 

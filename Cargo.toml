@@ -11,6 +11,7 @@ publish = false
 repository = "https://github.com/ayoola-xet/bowst"
 
 [workspace.dependencies]
+bowst-book = { path = "crates/bowst-book" }
 bowst-core = { path = "crates/bowst-core" }
 
 thiserror = "2"
