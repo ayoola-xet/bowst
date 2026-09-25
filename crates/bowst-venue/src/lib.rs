@@ -5,6 +5,7 @@
 //! - [`binance`]: Binance Spot decoders.
 //! - [`ws`]: allocation-free client WebSocket protocol and client.
 //! - [`net`]: TCP/TLS transport and a minimal HTTP/1.1 client for REST calls.
+//! - [`backoff`], [`ratelimit`]: reconnect backoff and request budgets shared by all venues.
 //!
 //! Decoders are pure: bytes in, typed events out. They validate everything and convert
 //! prices and quantities exactly (never rounding), so malformed or unexpected venue data is
@@ -14,10 +15,12 @@
     deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)
 )]
 
+pub mod backoff;
 pub mod binance;
 pub mod json;
 pub mod levels;
 pub mod net;
+pub mod ratelimit;
 pub mod ws;
 
 use bowst_core::Symbol;
