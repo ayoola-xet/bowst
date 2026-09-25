@@ -9,6 +9,7 @@ Each significant architecture decision gets one short record here, numbered in o
 | [0003](0003-spsc-rings-between-threads.md) | Lock-free SPSC rings as the only hot-path channel | Accepted |
 | [0004](0004-order-book-representation.md) | Order book as a sorted array with the best level last | Accepted |
 | [0005](0005-json-decoding.md) | In-house allocation-free JSON reader for venue messages | Accepted |
+| [0006](0006-websocket-protocol.md) | In-house client WebSocket protocol over a pre-allocated buffer | Accepted |
 
 ## Template
 
