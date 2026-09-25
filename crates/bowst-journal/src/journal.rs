@@ -354,9 +354,6 @@ impl Writer {
             while ring.read_with(|record| sink.write(record)).is_some() {
                 wrote_any = true;
             }
-            if sink.error.is_none() && sink.segment.bytes >= sink.config.segment_bytes {
-                sink.rotate();
-            }
             if last_flush.elapsed() >= sink.config.flush_every {
                 sink.guard("flush", |s| s.segment.out.flush());
                 last_flush = Instant::now();
@@ -388,6 +385,15 @@ impl Sink {
         if self.error.is_some() {
             self.stats.lost_after_failure = self.stats.lost_after_failure.saturating_add(1);
             return;
+        }
+        // Checked per record, not per drained batch, so a backlog cannot grow a segment past
+        // the limit by more than one record.
+        if self.segment.bytes >= self.config.segment_bytes {
+            self.rotate();
+            if self.error.is_some() {
+                self.stats.lost_after_failure = self.stats.lost_after_failure.saturating_add(1);
+                return;
+            }
         }
         let crc = record_checksum(record);
         let header_crc = header_checksum(record, crc);
@@ -446,5 +452,65 @@ impl Sink {
             path: self.segment.path.clone(),
             source,
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use bowst_core::{MonoTime, WallTime};
+
+    /// A writer that finds a large backlog in the ring (it fell behind, e.g. a slow disk) must
+    /// still start a new segment as soon as the current one reaches the limit, not after the
+    /// backlog is drained.
+    #[test]
+    fn segments_respect_the_limit_when_draining_a_backlog() {
+        let dir =
+            std::env::temp_dir().join(format!("bowst-journal-backlog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = JournalConfig::new(&dir);
+        config.ring_bytes = 1 << 20;
+        config.segment_bytes = 16 * 1024;
+        let (ring, consumer) = bytes_ring::channel(config.ring_bytes).unwrap();
+        let shared = Arc::new(Shared::default());
+        let mut producer = JournalProducer {
+            ring,
+            pending_gap: 0,
+            shared: Arc::clone(&shared),
+        };
+        let header = RecordHeader {
+            kind: Kind::MD_MESSAGE,
+            source: 1,
+            mono: MonoTime::from_nanos(1),
+            wall: WallTime::from_nanos(2),
+        };
+        let payload = [7_u8; 1_000];
+        for _ in 0..400 {
+            assert!(producer.append(header, &[&payload]));
+        }
+        // The whole backlog is in the ring before the writer runs.
+        shared.stop.store(true, Ordering::Release);
+        let segment = Segment::create(&dir, 0).unwrap();
+        let stats = Writer::new(config.clone(), consumer, shared, segment)
+            .run()
+            .unwrap();
+        assert_eq!(stats.records, 400);
+
+        let record = u64::try_from(RECORD_HEADER_LEN + payload.len()).unwrap();
+        let header_len = u64::try_from(FILE_HEADER_LEN).unwrap();
+        let mut sizes: Vec<u64> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .collect();
+        sizes.sort_unstable();
+        assert!(sizes.len() >= 20, "{sizes:?}");
+        let largest = sizes.last().copied().unwrap();
+        assert!(
+            largest < header_len + config.segment_bytes + record,
+            "segment of {largest} bytes exceeds the limit by more than one record"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
