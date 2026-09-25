@@ -1,0 +1,27 @@
+[package]
+name = "bowst-core"
+description = "Core domain types, fixed-point numbers, clocks and lock-free channels for Bowst."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "ring"
+harness = false
+
+[[bench]]
+name = "fixed_point"
+harness = false
+
+[lints]
+workspace = true
