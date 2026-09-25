@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
+**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`, Binance Spot market-data decoding in `crates/bowst-venue`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -312,7 +312,7 @@ Nothing goes live without passing all of these layers, in this order.
 8. **Shadow / minimum size live:** real orders at the venue minimum size with tight limits, for at least 2 weeks.
 9. **Staged capital ramp:** limits raised step by step (for example 1% → 5% → 25% → 100% of target), each step gated by the review metrics in §16.
 
-CI (GitHub Actions) runs `fmt`, `clippy -D warnings`, tests, doc build, Miri on all `unsafe` code, `cargo-deny` (licenses and advisories), `cargo-audit`, and a benchmark build on every PR. Fuzz smoke runs are added with the first venue decoder in Phase 1. `main` is protected and releases are tagged and reproducible.
+CI (GitHub Actions) runs `fmt`, `clippy -D warnings`, tests, doc build, Miri on all `unsafe` code, `cargo-deny` (licenses and advisories), `cargo-audit`, a benchmark build, and a 60-second fuzz run of every decoder on every PR. `main` is protected and releases are tagged and reproducible.
 
 ---
 
@@ -427,7 +427,7 @@ The architecture above holds either way, but these answers change the build orde
 3. **Venue market-maker programs.** Are we joining official MM programs (fee rebates, uptime and spread obligations)? The obligations become hard strategy constraints.
 4. **Capital and limits.** Starting capital per venue, max drawdown tolerance per day and in total, and the target inventory range.
 5. **Hosting budget.** Cloud in the venue region is the default. Bare-metal colocation where offered costs more and is faster.
-6. **Legal entity, licensing and jurisdiction.** Market making may need registration depending on venue and jurisdiction. This must be resolved before live trading.
+6. **Legal entity, licensing and jurisdiction.** Market making may need registration depending on venue and jurisdiction. This must be resolved before live trading. Note: the development environment is in a location both venues restrict (`api.binance.com` returns HTTP 451 and Bybit returns HTTP 403). Test fixtures are recorded from Binance's official public market-data mirror (`data-api.binance.vision`), which serves public data only. Whether the business may trade on each venue depends on the trading entity's jurisdiction and the venue's terms, not on where servers are placed, and needs legal confirmation. Geo-restrictions are never circumvented.
 7. **Team.** Who owns on-call, risk-limit sign-off and the four-eyes approvals?
 
 ---
