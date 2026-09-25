@@ -25,3 +25,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "bytes_ring"
+harness = false

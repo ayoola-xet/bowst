@@ -47,7 +47,7 @@ struct Slot<T> {
 /// pair, with anything else.
 #[derive(Debug, Default)]
 #[repr(align(128))]
-struct CachePadded<T>(T);
+pub(crate) struct CachePadded<T>(pub(crate) T);
 
 /// Error from [`channel`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

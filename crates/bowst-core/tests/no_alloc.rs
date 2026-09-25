@@ -2,7 +2,7 @@
 
 use bowst_core::alloc_counter::{CountingAllocator, count_allocations};
 use bowst_core::fixed::MAX_TEXT_LEN;
-use bowst_core::{ClientOrderIdGen, Dec, Increment, Price, Rounding, Side, ring};
+use bowst_core::{ClientOrderIdGen, Dec, Increment, Price, Rounding, Side, bytes_ring, ring};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
@@ -52,6 +52,23 @@ fn client_order_ids_do_not_allocate() {
         for _ in 0..ROUNDS {
             let id = ids.next().unwrap();
             assert_eq!(id.encode().as_str().len(), 18);
+        }
+    });
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+fn byte_ring_write_and_read_do_not_allocate() {
+    let (mut tx, mut rx) = bytes_ring::channel(4096).unwrap();
+    let record = [5_u8; 459];
+    let ((), allocations) = count_allocations(|| {
+        for _ in 0..ROUNDS {
+            tx.write_with(record.len() + 8, |dst| {
+                dst[..8].copy_from_slice(&42_u64.to_le_bytes());
+                dst[8..].copy_from_slice(&record);
+            })
+            .unwrap();
+            assert_eq!(rx.read_with(<[u8]>::len), Some(467));
         }
     });
     assert_eq!(allocations, 0);
