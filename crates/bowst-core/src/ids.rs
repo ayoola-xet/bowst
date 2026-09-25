@@ -25,6 +25,15 @@ impl VenueId {
         }
     }
 
+    /// Stable numeric code, used as the source field of journal records. Never reuse a code.
+    #[must_use]
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::Binance => 1,
+            Self::Bybit => 2,
+        }
+    }
+
     /// Looks a venue up by its [`as_str`](Self::as_str) name.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {

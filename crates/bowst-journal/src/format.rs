@@ -55,6 +55,8 @@ impl Kind {
     pub const MD_SNAPSHOT: Self = Self(0x0101);
     /// A market-data status change. Payload: UTF-8 text. Source: venue ID.
     pub const MD_STATUS: Self = Self(0x0102);
+    /// The market-data connection ended and every book was reset. No payload. Source: venue ID.
+    pub const MD_RESET: Self = Self(0x0103);
 }
 
 /// A record's header fields (the checksum is handled by the writer and reader).

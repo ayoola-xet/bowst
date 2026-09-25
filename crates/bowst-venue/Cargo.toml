@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 bowst-book.workspace = true
 bowst-core.workspace = true
+bowst-journal.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 sha1_smol.workspace = true

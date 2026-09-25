@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool). Remaining for Phase 1: the event journal, telemetry, and the 72-hour soak run. No trading code yet.
+**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009). Remaining for Phase 1: telemetry and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -228,7 +228,7 @@ The strategy is a pure, deterministic module. v1 ships a proven baseline. Alpha 
 - **Startup sequence:** load config, then connect order entry and query all open orders, positions and balances over REST, then **cancel all unknown or open orders**, then subscribe to market data, build and validate books, then pass warm-up checks, then enable quoting instrument by instrument. The engine never trusts state from a previous run over venue truth.
 - **Continuous reconciliation:** every N seconds, compare internal positions, balances and open orders with the venue REST view. A small drift from in-flight messages is tolerated inside a time window. A persistent mismatch triggers the kill switch.
 - **Unknown order state** (timeout with no ack): mark it `Unknown`, count it against limits as if live, and query it by client order ID until resolved.
-- **Replay:** `bowst replay <journal>` reproduces a session bit-for-bit for post-mortems and regression tests.
+- **Replay:** a journal reproduces a session exactly for post-mortems and regression tests. Market data replays today with `bowst-md --replay <dir>` (ADR 0009); order and risk events join when those components are built.
 
 ---
 
