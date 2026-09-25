@@ -79,6 +79,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowst-md"
+version = "0.1.0"
+dependencies = [
+ "bowst-book",
+ "bowst-core",
+ "bowst-venue",
+]
+
+[[package]]
 name = "bowst-venue"
 version = "0.1.0"
 dependencies = [
