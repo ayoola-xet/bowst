@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bowst-book = { path = "../crates/bowst-book" }
 bowst-core = { path = "../crates/bowst-core" }
+bowst-journal = { path = "../crates/bowst-journal" }
 bowst-venue = { path = "../crates/bowst-venue" }
 
 # Kept out of the main workspace: fuzzing needs nightly and its own build flags.
@@ -64,6 +65,13 @@ bench = false
 [[bin]]
 name = "http_response"
 path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_records"
+path = "fuzz_targets/journal_records.rs"
 test = false
 doc = false
 bench = false

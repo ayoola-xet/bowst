@@ -4,8 +4,13 @@
 //! operations. It runs the same session code as the engine.
 //!
 //! ```text
-//! bowst-md [--symbols BTCUSDT,ETHUSDT] [--seconds 60] [--stream URL] [--rest URL]
+//! bowst-md [--symbols BTCUSDT,ETHUSDT] [--seconds 60] [--stream URL] [--rest URL] [--journal DIR]
+//! bowst-md --replay DIR
 //! ```
+//!
+//! `--journal DIR` records the session (every raw message, applied snapshot and reset) for
+//! exact replay. `--replay DIR` replays a recorded journal through the same book logic and
+//! prints the final books and a report.
 //!
 //! Defaults point at Binance's public market-data endpoints (`data-stream.binance.vision`,
 //! `data-api.binance.vision`), which serve public data only. The exit code is non-zero if any
@@ -35,6 +40,8 @@ struct Args {
     seconds: u64,
     stream: String,
     rest: String,
+    journal: Option<std::path::PathBuf>,
+    replay: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -43,6 +50,8 @@ fn parse_args() -> Result<Args, String> {
         seconds: 30,
         stream: DEFAULT_STREAM.into(),
         rest: DEFAULT_REST.into(),
+        journal: None,
+        replay: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -62,9 +71,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--stream" => args.stream = value()?,
             "--rest" => args.rest = value()?,
+            "--journal" => args.journal = Some(value()?.into()),
+            "--replay" => args.replay = Some(value()?.into()),
             "-h" | "--help" => {
                 return Err(
-                    "usage: bowst-md [--symbols A,B] [--seconds N] [--stream URL] [--rest URL]"
+                    "usage: bowst-md [--symbols A,B] [--seconds N] [--stream URL] [--rest URL] [--journal DIR]\n       bowst-md --replay DIR"
                         .into(),
                 );
             }
@@ -182,6 +193,102 @@ fn print_board(board: &Board, instruments: &InstrumentTable, previous: &mut BTre
     }
 }
 
+/// Replays a journal and prints the final books.
+fn replay_journal(dir: &std::path::Path) -> ExitCode {
+    let mut reader = match bowst_journal::JournalReader::open(dir) {
+        Ok(reader) => reader,
+        Err(e) => {
+            eprintln!("cannot open journal: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let board = Arc::new(Mutex::new(Board::default()));
+    // The journal names its instruments; symbols here only label status lines.
+    let mut recorder = Recorder {
+        board: Arc::clone(&board),
+        symbols: Vec::new(),
+    };
+    let report = match bowst_venue::binance::replay::replay(&mut reader, &mut recorder) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("replay failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "replayed {} session(s): {} messages, {} snapshots, {} resets, {} records missing{}",
+        report.sessions,
+        report.messages,
+        report.snapshots,
+        report.resets,
+        report.dropped,
+        if report.torn_tail {
+            ", torn final record (unclean shutdown)"
+        } else {
+            ""
+        }
+    );
+    if let Ok(board) = board.lock() {
+        for (id, top) in &board.tops {
+            println!(
+                "instrument #{id}: bid {:?} ask {:?} depth {}/{} after {} updates",
+                top.bid.map(|(p, q)| (p.get(), q.get())),
+                top.ask.map(|(p, q)| (p.get(), q.get())),
+                top.depth.0,
+                top.depth.1,
+                top.updates
+            );
+        }
+    }
+    if report.dropped > 0 {
+        eprintln!("journal is incomplete: replay is not exact after the first gap");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints the board once a second for `duration`. Returns the instruments that were ever live.
+fn watch(
+    board: &Mutex<Board>,
+    instruments: &InstrumentTable,
+    duration: Duration,
+) -> BTreeMap<u32, bool> {
+    let started = Instant::now();
+    let mut previous = BTreeMap::new();
+    let mut ever_live = BTreeMap::new();
+    while started.elapsed() < duration {
+        thread::sleep(Duration::from_secs(1));
+        if let Ok(board) = board.lock() {
+            println!("--- {:>4}s", started.elapsed().as_secs());
+            print_board(&board, instruments, &mut previous);
+            for (id, live) in &board.live {
+                if *live {
+                    ever_live.insert(*id, true);
+                }
+            }
+        }
+    }
+    ever_live
+}
+
+/// Flushes and closes the journal, printing its statistics. `false` if it failed.
+fn finish_journal(handle: bowst_journal::JournalHandle) -> bool {
+    println!("journal health: {:?}", handle.health());
+    match handle.finish() {
+        Ok(stats) => {
+            println!(
+                "journal: {} records, {} bytes, {} segment(s), {} dropped",
+                stats.records, stats.bytes, stats.segments, stats.dropped
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("journal failed: {e}");
+            false
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -190,6 +297,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(dir) = &args.replay {
+        return replay_journal(dir);
+    }
     let tls = match TlsConfig::from_platform_roots() {
         Ok(tls) => tls,
         Err(e) => {
@@ -227,6 +337,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let mut journal = None;
+    if let Some(dir) = &args.journal {
+        match bowst_journal::start(bowst_journal::JournalConfig::new(dir)) {
+            Ok((producer, handle)) => {
+                session = session.with_journal(producer);
+                journal = Some(handle);
+                println!("journaling to {}", dir.display());
+            }
+            Err(e) => {
+                eprintln!("could not start journal: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let md = thread::Builder::new().name("md".into()).spawn(move || {
@@ -238,26 +362,17 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let started = Instant::now();
-    let mut previous = BTreeMap::new();
-    let mut ever_live = BTreeMap::new();
-    while started.elapsed() < Duration::from_secs(args.seconds) {
-        thread::sleep(Duration::from_secs(1));
-        if let Ok(board) = board.lock() {
-            println!("--- {:>4}s", started.elapsed().as_secs());
-            print_board(&board, &instruments, &mut previous);
-            for (id, live) in &board.live {
-                if *live {
-                    ever_live.insert(*id, true);
-                }
-            }
-        }
-    }
+    let ever_live = watch(&board, &instruments, Duration::from_secs(args.seconds));
     stop.store(true, Ordering::Relaxed);
     let Ok(stats) = md.join() else {
         eprintln!("market-data thread panicked");
         return ExitCode::FAILURE;
     };
+    if let Some(handle) = journal
+        && !finish_journal(handle)
+    {
+        return ExitCode::FAILURE;
+    }
     println!(
         "summary: {} messages, {} deltas applied, {} book invalidations, {} connections, {}/{} snapshots applied/requested",
         stats.messages,

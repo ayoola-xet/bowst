@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool). Remaining for Phase 1: the event journal, telemetry, and the 72-hour soak run. No trading code yet.
+**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009). Remaining for Phase 1: telemetry and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -142,7 +142,7 @@ These are enforced in code review and by tests (§10.5).
 | `bowst-risk` | Pre-trade gate (synchronous, hot path) and post-trade monitors (async). Kill switch. | See §7. Fails closed. |
 | `bowst-strategy` | Fair value, spread, skew and quote ladder. Pure function of (state, params) → desired quotes. | Deterministic. No I/O. Fully unit-testable. |
 | `bowst-position` | Positions, average cost, realized and unrealized PnL, fees and rebates per venue and globally. | Reconciled against venue balances (§8). |
-| `bowst-journal` | Append-only binary event log (mmap). Every inbound and outbound event is recorded. | Drives deterministic replay and post-mortems. |
+| `bowst-journal` | Append-only binary event log: checksummed, rotated segment files written by a background thread from a lock-free byte ring (ADR 0009). Every inbound and outbound event is recorded. | Drives deterministic replay and post-mortems. Never silently incomplete: drops are marked and the journal's health gates trading. |
 | `bowst-sim` | Exchange simulator: matching engine with queue position, latency injection and venue-specific quirks. | Used for backtests, integration tests and chaos tests. |
 | `bowst-control` | Authenticated control API (gRPC or HTTPS with mTLS) plus the `bowstctl` CLI. | Kill switch, pause/resume per instrument, parameter updates, status. |
 | `bowst-telemetry` | Metrics (Prometheus), structured logs, latency histograms (HDR). | All off the hot path. |
@@ -228,7 +228,7 @@ The strategy is a pure, deterministic module. v1 ships a proven baseline. Alpha 
 - **Startup sequence:** load config, then connect order entry and query all open orders, positions and balances over REST, then **cancel all unknown or open orders**, then subscribe to market data, build and validate books, then pass warm-up checks, then enable quoting instrument by instrument. The engine never trusts state from a previous run over venue truth.
 - **Continuous reconciliation:** every N seconds, compare internal positions, balances and open orders with the venue REST view. A small drift from in-flight messages is tolerated inside a time window. A persistent mismatch triggers the kill switch.
 - **Unknown order state** (timeout with no ack): mark it `Unknown`, count it against limits as if live, and query it by client order ID until resolved.
-- **Replay:** `bowst replay <journal>` reproduces a session bit-for-bit for post-mortems and regression tests.
+- **Replay:** a journal reproduces a session exactly for post-mortems and regression tests. Market data replays today with `bowst-md --replay <dir>` (ADR 0009); order and risk events join when those components are built.
 
 ---
 

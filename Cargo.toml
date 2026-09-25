@@ -13,8 +13,10 @@ repository = "https://github.com/ayoola-xet/bowst"
 [workspace.dependencies]
 bowst-book = { path = "crates/bowst-book" }
 bowst-core = { path = "crates/bowst-core" }
+bowst-journal = { path = "crates/bowst-journal" }
 bowst-venue = { path = "crates/bowst-venue" }
 
+crc32fast = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 sha1_smol = "1"
