@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Build plan (v0.2). No production code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
+**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`, Binance Spot market-data decoding in `crates/bowst-venue`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -124,7 +124,7 @@ These are enforced in code review and by tests (§10.5).
 2. **No locks, no syscalls except socket I/O, no blocking.** Logging on the hot path writes a fixed-size binary record to a ring. Formatting happens on another thread.
 3. **Fixed-point numbers only.** Prices are `i64` ticks and quantities are `i64` lots, scaled per instrument. `f64` is allowed only inside the strategy's model math, and results are rounded to ticks and lots with an explicit rounding direction (bids round down, asks round up). Money never goes through floats.
 4. **Fast parsing.** Use `sonic-rs` or `simd-json` for JSON venues, with zero-copy decoding into borrowed buffers. Where a venue offers a binary protocol (SBE, FIX, native binary), use it.
-5. **Cache-friendly data.** The book is a price-indexed array ladder around the mid, not a tree. Hot structs are `#[repr(C)]` and cache-line aligned, with no false sharing between threads.
+5. **Cache-friendly data.** Each book side is a pre-allocated array sorted with the best level last, not a tree (ADR 0004). Hot structs are `#[repr(C)]` and cache-line aligned, with no false sharing between threads. Messages passed between threads fit in one ring slot's cache line (`ring::SINGLE_LINE_PAYLOAD`, 56 bytes).
 6. **Busy-polling on isolated cores.** Use `isolcpus`/`nohz_full`, IRQ affinity away from trading cores, and `SCHED_FIFO` where permitted.
 7. **Time.** Use `CLOCK_MONOTONIC` via TSC for latency and `CLOCK_REALTIME` (chrony-disciplined) for venue timestamps. Every event carries both.
 8. **Branch-predictable failure paths.** Risk rejects are cold paths marked `#[cold]`.
@@ -306,13 +306,13 @@ Nothing goes live without passing all of these layers, in this order.
 2. **Fuzzing** (`cargo-fuzz`): every venue message decoder. Malformed input must never panic.
 3. **Adapter conformance** (§9) against recorded traffic and testnets.
 4. **Simulation and backtest:** the strategy runs against `bowst-sim` fed with recorded L2/L3 data, including realistic latency and queue position. Report PnL, markouts, inventory paths and fill rates.
-5. **Performance gates:** criterion micro-benchmarks and an end-to-end tick-to-order benchmark measured with HDR histograms. CI fails on a latency regression or any hot-path allocation.
+5. **Performance gates:** criterion micro-benchmarks and an end-to-end tick-to-order benchmark measured with HDR histograms. CI fails on any hot-path allocation (counting-allocator tests) and on benchmarks that no longer compile. Failing CI on a *latency* regression needs a dedicated, pinned benchmark host, because shared CI runners vary by more than the 10% threshold. That host is set up with production hosting in Phase 5. Until then, hot-path PRs attach before/after numbers (CLAUDE.md §3).
 6. **Chaos tests:** kill the process mid-session, drop sockets, inject sequence gaps, delay acks, and duplicate or reorder messages. The engine must always recover to a safe state (no unknown orders, no uncapped exposure).
 7. **Paper trading:** live market data with simulated fills, running for at least 2 weeks.
 8. **Shadow / minimum size live:** real orders at the venue minimum size with tight limits, for at least 2 weeks.
 9. **Staged capital ramp:** limits raised step by step (for example 1% → 5% → 25% → 100% of target), each step gated by the review metrics in §16.
 
-CI (GitHub Actions) runs `fmt`, `clippy -D warnings`, tests, `cargo-deny` (licenses and advisories), `cargo-audit`, fuzz smoke runs and benchmarks on every PR. `main` is protected and releases are tagged and reproducible.
+CI (GitHub Actions) runs `fmt`, `clippy -D warnings`, tests, doc build, Miri on all `unsafe` code, `cargo-deny` (licenses and advisories), `cargo-audit`, a benchmark build, and a 60-second fuzz run of every decoder on every PR. `main` is protected and releases are tagged and reproducible.
 
 ---
 
@@ -384,7 +384,7 @@ Each phase has exit criteria. A phase is not done until its criteria are met and
 
 | Phase | Scope | Exit criteria | Est. |
 |---|---|---|---|
-| **0. Foundations** | Workspace, CI, core types (fixed-point, IDs, events), SPSC ring, clock, allocation-counting allocator, ADRs. | CI green with lint, test, audit and bench jobs. Ring benchmarked at < 100 ns handoff. | 1–2 wk |
+| **0. Foundations** | Workspace, CI, core types (fixed-point, IDs, events), SPSC ring, clock, allocation-counting allocator, ADRs. | CI green with lint, test, Miri, supply-chain and bench-build jobs. Ring handoff within noise of the host's bare atomic-signal floor. | 1–2 wk |
 | **1. Market data** | Shared venue plumbing (§9.1) and the Binance Spot adapter (market data only), book builder with gap and resync handling, journal, telemetry. | 72 h continuous run with zero undetected gaps. Book matches venue snapshots. Decode + book update < 5 µs p99. | 2–3 wk |
 | **2. Order entry + OMS** | Binance Spot order entry, OMS state machine, reconciliation, safe startup and shutdown, cancel-on-disconnect. | Conformance suite passes on testnet. Chaos tests leave zero orphaned orders. | 3–4 wk |
 | **3. Risk + control plane** | Full pre-trade gate, monitors, kill switch, watchdog process, `bowstctl`, limit config signing. | Every risk rule has a test proving it blocks. Kill-to-all-cancelled < 1 s verified on testnet. | 2–3 wk |
@@ -427,7 +427,7 @@ The architecture above holds either way, but these answers change the build orde
 3. **Venue market-maker programs.** Are we joining official MM programs (fee rebates, uptime and spread obligations)? The obligations become hard strategy constraints.
 4. **Capital and limits.** Starting capital per venue, max drawdown tolerance per day and in total, and the target inventory range.
 5. **Hosting budget.** Cloud in the venue region is the default. Bare-metal colocation where offered costs more and is faster.
-6. **Legal entity, licensing and jurisdiction.** Market making may need registration depending on venue and jurisdiction. This must be resolved before live trading.
+6. **Legal entity, licensing and jurisdiction.** Market making may need registration depending on venue and jurisdiction. This must be resolved before live trading. Note: the development environment is in a location both venues restrict (`api.binance.com` returns HTTP 451 and Bybit returns HTTP 403). Test fixtures are recorded from Binance's official public market-data mirror (`data-api.binance.vision`), which serves public data only. Whether the business may trade on each venue depends on the trading entity's jurisdiction and the venue's terms, not on where servers are placed, and needs legal confirmation. Geo-restrictions are never circumvented.
 7. **Team.** Who owns on-call, risk-limit sign-off and the four-eyes approvals?
 
 ---
