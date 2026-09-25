@@ -6,6 +6,7 @@
 //! - [`instrument`]: instruments, their venue symbols and order rules.
 //! - [`time`]: monotonic and wall-clock timestamps behind a [`Clock`] trait.
 //! - [`ring`]: a bounded, lock-free single-producer/single-consumer channel.
+//! - [`bytes_ring`]: the same for variable-length byte records (journal traffic).
 //! - [`alloc_counter`]: a global allocator wrapper used by tests to prove hot paths do not allocate.
 //!
 //! Nothing in this crate performs I/O. Everything on the hot path is allocation-free
@@ -18,6 +19,7 @@
 )]
 
 pub mod alloc_counter;
+pub mod bytes_ring;
 pub mod event;
 pub mod fixed;
 pub mod ids;

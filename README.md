@@ -112,7 +112,7 @@ Every release is benchmarked against these numbers (§10.5). A regression beyond
 | `journal` | shared | Drains an SPSC ring into an mmap-ed append-only log. |
 | `control` | shared | Tokio runtime for the control API, metrics endpoint, REST reconciliation and config reloads. |
 
-Threads communicate **only** through bounded, lock-free single-producer/single-consumer ring buffers carrying fixed-size `Copy` structs. There are no mutexes on the hot path and no shared mutable state. Each instrument is owned by exactly one strategy thread.
+Threads communicate **only** through bounded, lock-free single-producer/single-consumer ring buffers: fixed-size `Copy` structs for hot-path events (`bowst_core::ring`), and variable-length byte records for journal traffic (`bowst_core::bytes_ring`). There are no mutexes on the hot path and no shared mutable state. Each instrument is owned by exactly one strategy thread.
 
 ---
 
