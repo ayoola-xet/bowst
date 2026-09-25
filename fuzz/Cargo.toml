@@ -1,0 +1,48 @@
+[package]
+name = "bowst-fuzz"
+description = "Fuzz targets for Bowst decoders (cargo fuzz)."
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bowst-book = { path = "../crates/bowst-book" }
+bowst-core = { path = "../crates/bowst-core" }
+bowst-venue = { path = "../crates/bowst-venue" }
+
+# Kept out of the main workspace: fuzzing needs nightly and its own build flags.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "json_reader"
+path = "fuzz_targets/json_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binance_depth_update"
+path = "fuzz_targets/binance_depth_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binance_depth_snapshot"
+path = "fuzz_targets/binance_depth_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binance_exchange_info"
+path = "fuzz_targets/binance_exchange_info.rs"
+test = false
+doc = false
+bench = false
