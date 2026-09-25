@@ -1,8 +1,12 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Build plan (v0.1). No production code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
+**Status:** Build plan (v0.2). No production code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
+
+**Current scope: spot markets on Binance and Bybit**, with the venue layer built so similar centralized exchanges (for example OKX, Bitget, Gate, KuCoin) can be added as adapters without touching the engine. Perpetuals, margin and other asset classes are out of scope for now. The design keeps room for them (§9.4) but none of that work is scheduled.
+
+Engineering standards for everyone working in this repository are in [`CLAUDE.md`](CLAUDE.md).
 
 ---
 
@@ -168,7 +172,14 @@ The strategy is a pure, deterministic module. v1 ships a proven baseline. Alpha 
 - Use native amend where the venue supports it. Otherwise use cancel/new with in-flight accounting.
 - A per-venue token bucket mirrors the venue's published limits at 80% utilization. When the budget is low, the top of book gets priority.
 
-### 6.5 Defensive behavior
+### 6.5 Spot-specific constraints
+- **No shorting.** An ask can only be quoted against base currency we actually hold, and a bid only against quote currency we hold. Inventory is the pair of free balances (base, quote) per venue, not a signed position. The strategy targets a base/quote split (for example 50/50 by value) and skews toward it.
+- **Balances are the limit.** Open orders lock balance on the venue. The risk gate tracks locked and free balance locally and never sends an order the venue would reject for insufficient funds.
+- **Rebalancing** between assets and between venues (transfers, or a taker trade to restore the target split) is an explicit, rate-limited, operator-visible action, never a side effect of quoting.
+- **Fees** depend on the VIP tier and discounts (for example paying fees in BNB on Binance). The fee schedule is loaded per account at startup and refreshed, and the minimum edge (§6.2) uses the live maker fee.
+- **Exchange filters** (tick size, lot step, minimum notional, percent-price bands) are loaded from the venue at startup and enforced locally before sending, so filter rejects count as bugs.
+
+### 6.6 Defensive behavior
 - **Stale data:** if a book has not updated within `max_book_age` (venue-specific, for example 500 ms), pull quotes for that instrument.
 - **Volatility spike:** if short-horizon σ exceeds a threshold, widen spreads by a multiplier or pull quotes.
 - **Adverse selection monitor:** track markout PnL at 1s, 5s and 30s after each fill. If markouts stay negative, widen automatically and raise an alert.
@@ -186,11 +197,12 @@ The strategy is a pure, deterministic module. v1 ships a proven baseline. Alpha 
 | Instrument not in `Quoting` state (book invalid, paused, halted) | Reject |
 | Price outside ±X% or ±N ticks of fair value (fat finger) | Reject + alert |
 | Order qty > max order size, or notional > max order notional | Reject |
-| Resulting position (worst case, including all open orders filling) > max position | Reject the inventory-adding side |
+| Resulting base inventory (worst case, all open orders filling) outside the min/max band | Reject the side that pushes it further out |
 | Open order count > max per instrument or venue | Reject |
 | Order rate over the local budget | Reject / defer |
 | Would cross our own resting order (self-trade) | Reject, or use the venue's STP mode |
-| Insufficient balance or margin (local view) | Reject |
+| Insufficient free balance after locks (local view) | Reject |
+| Violates venue filters (tick, lot step, min notional, price band) | Reject + alert (it is a bug) |
 
 ### 7.2 Post-trade and portfolio (async monitors, ≤ 10 ms cadence)
 - Realized + unrealized PnL drawdown per instrument, venue, day and all-time high-water mark leads to a **pause**, then a **kill**.
@@ -238,7 +250,51 @@ Each adapter handles authentication and signing, the connection lifecycle (heart
 
 **Adapter conformance suite:** every adapter must pass the same scenario tests against recorded venue traffic and the venue's testnet before it can be enabled: gap recovery, reconnect mid-order, fill-before-ack, cancel of a filled order, rejects, rate-limit responses and maintenance windows.
 
-**Proposed venue order** (pending confirmation, see §17): start with one deep, well-documented venue with a testnet and an amend API. Add a second venue only after the first has run clean live for a set period. Cross-venue hedging comes after that.
+### 9.1 Shared venue plumbing (write once, reuse everywhere)
+
+Binance, Bybit and similar exchanges differ in message formats but share the same mechanics. Those mechanics live in one shared module, and each adapter only supplies the venue-specific parts:
+
+| Shared building block | What an adapter supplies |
+|---|---|
+| WebSocket connection manager: connect, ping/pong, reconnect with jittered backoff, forced reconnect before the venue's connection lifetime expires | URLs, ping format, lifetime |
+| Snapshot + delta book sync with sequence validation and resync | How to fetch a snapshot and which fields carry the sequence numbers |
+| Request signing (HMAC-SHA256, Ed25519, RSA) | Which fields are signed and in what order |
+| Rate limiter (token buckets for weight, order count and connection limits) | The limit table and the response headers that report usage |
+| Symbol, tick, lot and filter normalization | The exchange-info endpoint and field mapping |
+| Error mapping into a single `VenueError` enum | The venue's error codes |
+
+A new "similar" exchange should mostly be a new decoder, a signing config and a limits table.
+
+### 9.2 Binance Spot (venue 1)
+
+| Area | Plan |
+|---|---|
+| Market data | Diff-depth WebSocket stream plus REST snapshot, synchronized with Binance's documented `lastUpdateId` / `U` / `u` procedure. Trade stream for flow signals. Evaluate the binary (SBE) market data streams in Phase 8. |
+| Order entry | WebSocket API (persistent session, Ed25519 key, session logon) for lowest latency. REST is fallback and reconciliation only. Evaluate the FIX API for order entry and drop copy. |
+| Order updates | User data stream over the WebSocket API. |
+| Order types | `LIMIT_MAKER` (post-only) for all quotes. Cancel-replace and amend-keep-priority (quantity reduction) where they save rate-limit budget. |
+| Self-trade prevention | Venue STP mode set on every order, plus our own local check. |
+| Rate limits | Request weight per minute, order count per 10 s and per day, connection limits, all tracked from the usage headers. |
+| Hosting | AWS Tokyo (ap-northeast-1), confirmed by measured round-trip before committing. |
+
+### 9.3 Bybit Spot (venue 2)
+
+| Area | Plan |
+|---|---|
+| Market data | V5 public WebSocket order-book topic (snapshot + delta, update ID and sequence checks) and public trades. |
+| Order entry | V5 WebSocket trade API for lowest latency. REST for fallback and reconciliation. Batch place and cancel where available for spot. |
+| Order updates | V5 private WebSocket `order`, `execution` and `wallet` topics. |
+| Order types | Post-only limit orders. Native amend. |
+| Self-trade prevention | Venue SMP setting plus our own local check. |
+| Cancel on disconnect | Disconnection cancel protection (DCP), if enabled for spot on our account. |
+| Rate limits | Per-endpoint and per-UID limits, tracked from response headers. |
+| Hosting | Measure round-trip from candidate AWS regions (Singapore and Tokyo first) before choosing. |
+
+Venue details above are the plan. Each one is checked against the venue's current API documentation and testnet at the start of that venue's phase, and differences are recorded as an ADR. Any safety feature a venue lacks (for example cancel on disconnect) is covered by the independent watchdog (§7.3).
+
+### 9.4 Room to grow
+
+Perpetuals, margin and more venues are out of scope today. The design keeps room for them without building them now: instruments carry a `kind` (only `Spot` exists today), inventory accounting sits behind the `bowst-position` interface, and the risk gate is a list of rules so margin rules can be added later. Nothing speculative is implemented until it is scheduled.
 
 ---
 
@@ -282,7 +338,7 @@ CI (GitHub Actions) runs `fmt`, `clippy -D warnings`, tests, `cargo-deny` (licen
 
 ## 13. Deployment and infrastructure
 
-- **Placement decides network latency.** Run in the venue's primary region or availability zone. For example, several large crypto venues run matching in AWS Tokyo (ap-northeast-1). Others use their own data centers with colocation or cross-connect offerings. Measure round-trip from candidate hosts before choosing.
+- **Placement decides network latency.** Run in the venue's primary region and availability zone: AWS Tokyo (ap-northeast-1) is the expected location for Binance, and Bybit's region is chosen by measurement (§9.3). Measure round-trip from candidate hosts before choosing.
 - **One engine per venue region.** Cross-region coordination (net exposure, global kill) goes over a low-bandwidth control channel, never on the hot path.
 - **Hosts:** bare-metal or metal-class cloud instances. No noisy neighbors, and use a dedicated NIC where available. Linux tuning: `isolcpus`, `nohz_full`, `rcu_nocbs`, disabled C-states and frequency scaling, huge pages, IRQ affinity and tuned busy-polling. Kernel-bypass networking (AF_XDP/DPDK/Onload) is a later optimization, used only where venue-side latency makes it worthwhile.
 - **Clock:** chrony with a PTP/NTP hardware source where available. Drift beyond 1 ms raises an alert.
@@ -329,13 +385,14 @@ Each phase has exit criteria. A phase is not done until its criteria are met and
 | Phase | Scope | Exit criteria | Est. |
 |---|---|---|---|
 | **0. Foundations** | Workspace, CI, core types (fixed-point, IDs, events), SPSC ring, clock, allocation-counting allocator, ADRs. | CI green with lint, test, audit and bench jobs. Ring benchmarked at < 100 ns handoff. | 1–2 wk |
-| **1. Market data** | First venue adapter (MD only), book builder with gap and resync handling, journal, telemetry. | 72 h continuous run with zero undetected gaps. Book matches venue snapshots. Decode + book update < 5 µs p99. | 2–3 wk |
-| **2. Order entry + OMS** | Order gateway, OMS state machine, reconciliation, safe startup and shutdown, cancel-on-disconnect. | Conformance suite passes on testnet. Chaos tests leave zero orphaned orders. | 3–4 wk |
+| **1. Market data** | Shared venue plumbing (§9.1) and the Binance Spot adapter (market data only), book builder with gap and resync handling, journal, telemetry. | 72 h continuous run with zero undetected gaps. Book matches venue snapshots. Decode + book update < 5 µs p99. | 2–3 wk |
+| **2. Order entry + OMS** | Binance Spot order entry, OMS state machine, reconciliation, safe startup and shutdown, cancel-on-disconnect. | Conformance suite passes on testnet. Chaos tests leave zero orphaned orders. | 3–4 wk |
 | **3. Risk + control plane** | Full pre-trade gate, monitors, kill switch, watchdog process, `bowstctl`, limit config signing. | Every risk rule has a test proving it blocks. Kill-to-all-cancelled < 1 s verified on testnet. | 2–3 wk |
 | **4. Strategy + simulator** | Baseline quoting (§6), `bowst-sim`, backtest harness, markout analytics. | Positive expected net PnL after fees in the backtest over multiple regimes, with sane inventory. End-to-end tick-to-order < 20 µs p50. | 3–4 wk |
-| **5. Paper → min-size live** | Production hosting, dashboards, alerts, runbooks, paper then minimum-size live on venue 1. | 2 weeks paper plus 2 weeks minimum-size with no unexplained reconciliation breaks and no risk-rule misses. Live markouts consistent with the sim. | 4 wk |
-| **6. Capital ramp (venue 1)** | Staged limit increases. | Review at each step: PnL, markouts, drawdown, uptime and incidents. | 4+ wk |
-| **7. Multi-venue** | Adapters for venues 2..N, cross-venue fair value, global exposure limits, hedging. | Each new venue repeats phases 1–6 in reduced form. | ongoing |
+| **5. Paper → min-size live** | Production hosting, dashboards, alerts, runbooks, paper then minimum-size live on Binance Spot. | 2 weeks paper plus 2 weeks minimum-size with no unexplained reconciliation breaks and no risk-rule misses. Live markouts consistent with the sim. | 4 wk |
+| **6. Capital ramp (Binance)** | Staged limit increases. | Review at each step: PnL, markouts, drawdown, uptime and incidents. | 4+ wk |
+| **7. Bybit Spot** | Bybit adapter on the shared plumbing, cross-venue fair value, global inventory limits, cross-venue rebalancing. | Bybit repeats phases 1–6 in reduced form. The adapter should need little new plumbing code; if it does, the shared layer is fixed first. | 4–6 wk |
+| **7b. Similar venues** | Further spot exchanges (for example OKX), one at a time. | Same as Phase 7. | ongoing |
 | **8. Performance hardening** | Kernel bypass, binary protocols, profile-guided optimization, where measurements justify it. | Measured improvement in live fill quality, not just benchmarks. | ongoing |
 
 The earliest realistic date for **meaningful live capital is about 4–5 months** from the start of Phase 0. Skipping the validation phases is how market makers lose money quickly.
@@ -363,8 +420,10 @@ Every item needs a named owner and sign-off before real capital is enabled on a 
 
 The architecture above holds either way, but these answers change the build order and the adapter work:
 
-1. **Asset class and venues.** Crypto CEX (for example Binance, OKX, Bybit, Coinbase, Kraken), crypto perpetuals, DEX/on-chain, prediction markets, or traditional (equities/futures via FIX)? Which venue is first?
-2. **Spot, perpetuals or both?** Perpetuals add funding, margin and liquidation risk to the risk model.
+**Decided:** spot only, Binance first, Bybit second, similar exchanges after that (§9).
+
+1. **Trading pairs.** Which pairs to start with on Binance? Deep pairs (for example BTC/USDT) are competitive and tight. Mid-liquidity pairs usually pay better spreads but carry more inventory risk.
+2. **Account tier.** Current VIP tier and fee rates on each venue. Maker fees decide whether a spread is profitable at all.
 3. **Venue market-maker programs.** Are we joining official MM programs (fee rebates, uptime and spread obligations)? The obligations become hard strategy constraints.
 4. **Capital and limits.** Starting capital per venue, max drawdown tolerance per day and in total, and the target inventory range.
 5. **Hosting budget.** Cloud in the venue region is the default. Bare-metal colocation where offered costs more and is faster.
