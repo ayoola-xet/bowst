@@ -46,3 +46,17 @@ path = "fuzz_targets/binance_exchange_info.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ws_reader"
+path = "fuzz_targets/ws_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_handshake"
+path = "fuzz_targets/ws_handshake.rs"
+test = false
+doc = false
+bench = false

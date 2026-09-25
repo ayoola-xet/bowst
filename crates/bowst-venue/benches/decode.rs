@@ -9,6 +9,7 @@ use bowst_core::{Instrument, InstrumentId, InstrumentTable, VenueId};
 use bowst_venue::binance::depth::{DepthSnapshotDecoder, DepthUpdateDecoder};
 use bowst_venue::binance::exchange_info::decode_exchange_info;
 use bowst_venue::json::Reader;
+use bowst_venue::ws::reader::{ReaderConfig, WsEvent, WsReader};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/binance");
@@ -89,5 +90,53 @@ fn decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, decode);
+/// All recorded messages as one WebSocket byte stream, read through `WsReader` in 16 KiB
+/// socket-sized chunks: the framing cost alone, before JSON decoding.
+fn websocket(c: &mut Criterion) {
+    let stream = read("depth_stream.jsonl");
+    let mut wire = Vec::new();
+    let mut messages = 0_u64;
+    for line in stream.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        wire.push(0x81);
+        match u16::try_from(line.len()) {
+            Ok(len) if len < 126 => wire.push(u8::try_from(len).unwrap()),
+            Ok(len) => {
+                wire.push(126);
+                wire.extend_from_slice(&len.to_be_bytes());
+            }
+            Err(_) => {
+                wire.push(127);
+                wire.extend_from_slice(&u64::try_from(line.len()).unwrap().to_be_bytes());
+            }
+        }
+        wire.extend_from_slice(line);
+        messages += 1;
+    }
+    let config = ReaderConfig {
+        buffer: 256 * 1024,
+        max_frame: 128 * 1024,
+        max_message: 128 * 1024,
+    };
+    let mut reader = WsReader::new(config).unwrap();
+    let mut group = c.benchmark_group("ws");
+    group.throughput(Throughput::Elements(messages));
+    group.bench_function("read_all_recorded_frames", |b| {
+        b.iter(|| {
+            reader.reset();
+            let mut bytes = 0;
+            for chunk in wire.chunks(16 * 1024) {
+                let spare = reader.spare();
+                spare[..chunk.len()].copy_from_slice(chunk);
+                reader.commit(chunk.len());
+                while let Some(WsEvent::Text(payload)) = reader.next_event().unwrap() {
+                    bytes += payload.len();
+                }
+            }
+            black_box(bytes)
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, decode, websocket);
 criterion_main!(benches);
