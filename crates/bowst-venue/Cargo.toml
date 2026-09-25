@@ -1,0 +1,25 @@
+[package]
+name = "bowst-venue"
+description = "Venue adapters for Bowst: shared plumbing and per-venue decoders."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+bowst-book.workspace = true
+bowst-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true
