@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`, Binance Spot market-data decoding in `crates/bowst-venue`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
+**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`, Binance Spot market-data decoding and the WebSocket protocol in `crates/bowst-venue`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -256,7 +256,7 @@ Binance, Bybit and similar exchanges differ in message formats but share the sam
 
 | Shared building block | What an adapter supplies |
 |---|---|
-| WebSocket connection manager: connect, ping/pong, reconnect with jittered backoff, forced reconnect before the venue's connection lifetime expires | URLs, ping format, lifetime |
+| WebSocket protocol (allocation-free, ADR 0006) and connection manager: connect, ping/pong, reconnect with jittered backoff, forced reconnect before the venue's connection lifetime expires | URLs, ping format, lifetime |
 | Snapshot + delta book sync with sequence validation and resync | How to fetch a snapshot and which fields carry the sequence numbers |
 | Request signing (HMAC-SHA256, Ed25519, RSA) | Which fields are signed and in what order |
 | Rate limiter (token buckets for weight, order count and connection limits) | The limit table and the response headers that report usage |

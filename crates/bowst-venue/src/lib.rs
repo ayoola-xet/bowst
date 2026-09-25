@@ -3,6 +3,8 @@
 //! - [`json`]: the allocation-free JSON reader every JSON venue decoder uses.
 //! - [`levels`]: shared decoding of price levels into book types.
 //! - [`binance`]: Binance Spot decoders.
+//! - [`ws`]: allocation-free client WebSocket protocol and client.
+//! - [`net`]: TCP/TLS transport and a minimal HTTP/1.1 client for REST calls.
 //!
 //! Decoders are pure: bytes in, typed events out. They validate everything and convert
 //! prices and quantities exactly (never rounding), so malformed or unexpected venue data is
@@ -15,6 +17,8 @@
 pub mod binance;
 pub mod json;
 pub mod levels;
+pub mod net;
+pub mod ws;
 
 use bowst_core::Symbol;
 use bowst_core::fixed::FixedError;

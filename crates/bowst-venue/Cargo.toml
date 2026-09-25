@@ -11,6 +11,9 @@ repository.workspace = true
 [dependencies]
 bowst-book.workspace = true
 bowst-core.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+sha1_smol.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
