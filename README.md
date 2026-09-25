@@ -142,7 +142,7 @@ These are enforced in code review and by tests (§10.5).
 | `bowst-risk` | Pre-trade gate (synchronous, hot path) and post-trade monitors (async). Kill switch. | See §7. Fails closed. |
 | `bowst-strategy` | Fair value, spread, skew and quote ladder. Pure function of (state, params) → desired quotes. | Deterministic. No I/O. Fully unit-testable. |
 | `bowst-position` | Positions, average cost, realized and unrealized PnL, fees and rebates per venue and globally. | Reconciled against venue balances (§8). |
-| `bowst-journal` | Append-only binary event log (mmap). Every inbound and outbound event is recorded. | Drives deterministic replay and post-mortems. |
+| `bowst-journal` | Append-only binary event log: checksummed, rotated segment files written by a background thread from a lock-free byte ring (ADR 0009). Every inbound and outbound event is recorded. | Drives deterministic replay and post-mortems. Never silently incomplete: drops are marked and the journal's health gates trading. |
 | `bowst-sim` | Exchange simulator: matching engine with queue position, latency injection and venue-specific quirks. | Used for backtests, integration tests and chaos tests. |
 | `bowst-control` | Authenticated control API (gRPC or HTTPS with mTLS) plus the `bowstctl` CLI. | Kill switch, pause/resume per instrument, parameter updates, status. |
 | `bowst-telemetry` | Metrics (Prometheus), structured logs, latency histograms (HDR). | All off the hot path. |

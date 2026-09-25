@@ -12,6 +12,7 @@ Each significant architecture decision gets one short record here, numbered in o
 | [0006](0006-websocket-protocol.md) | In-house client WebSocket protocol over a pre-allocated buffer | Accepted |
 | [0007](0007-tls-and-transport.md) | TLS via rustls with platform trust roots; minimal HTTP client for REST | Accepted |
 | [0008](0008-market-data-session.md) | Market-data session: one stream, a separate snapshot thread, fail closed per instrument | Accepted |
+| [0009](0009-event-journal.md) | Event journal: hot-path byte ring, background writer, checksummed segments | Accepted |
 
 ## Template
 
