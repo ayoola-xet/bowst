@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "bin/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/ayoola-xet/bowst"
 [workspace.dependencies]
 bowst-book = { path = "crates/bowst-book" }
 bowst-core = { path = "crates/bowst-core" }
+bowst-venue = { path = "crates/bowst-venue" }
 
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"

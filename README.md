@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`, Binance Spot market-data decoding and the WebSocket protocol in `crates/bowst-venue`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
+**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool). Remaining for Phase 1: the event journal, telemetry, and the 72-hour soak run. No trading code yet.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -365,6 +365,7 @@ bowst/
 │   ├── bowst-control/         # API + bowstctl CLI
 │   └── bowst-telemetry/
 ├── bin/bowst/                 # engine entrypoint
+├── bin/bowst-md/              # market-data operator tool (live books, health)
 ├── bin/bowst-watchdog/        # independent cancel-all watchdog
 ├── config/                    # example configs (no secrets)
 ├── benches/                   # end-to-end latency benchmarks
