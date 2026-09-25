@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
+**Status:** Phase 0 (foundations) implemented in `crates/bowst-core`. Phase 1 in progress: order books in `crates/bowst-book`. No trading code yet. This document is the source of truth for how Bowst is built, tested and taken live. Change it before changing the architecture.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -124,7 +124,7 @@ These are enforced in code review and by tests (§10.5).
 2. **No locks, no syscalls except socket I/O, no blocking.** Logging on the hot path writes a fixed-size binary record to a ring. Formatting happens on another thread.
 3. **Fixed-point numbers only.** Prices are `i64` ticks and quantities are `i64` lots, scaled per instrument. `f64` is allowed only inside the strategy's model math, and results are rounded to ticks and lots with an explicit rounding direction (bids round down, asks round up). Money never goes through floats.
 4. **Fast parsing.** Use `sonic-rs` or `simd-json` for JSON venues, with zero-copy decoding into borrowed buffers. Where a venue offers a binary protocol (SBE, FIX, native binary), use it.
-5. **Cache-friendly data.** The book is a price-indexed array ladder around the mid, not a tree. Hot structs are `#[repr(C)]` and cache-line aligned, with no false sharing between threads. Messages passed between threads fit in one ring slot's cache line (`ring::SINGLE_LINE_PAYLOAD`, 56 bytes).
+5. **Cache-friendly data.** Each book side is a pre-allocated array sorted with the best level last, not a tree (ADR 0004). Hot structs are `#[repr(C)]` and cache-line aligned, with no false sharing between threads. Messages passed between threads fit in one ring slot's cache line (`ring::SINGLE_LINE_PAYLOAD`, 56 bytes).
 6. **Busy-polling on isolated cores.** Use `isolcpus`/`nohz_full`, IRQ affinity away from trading cores, and `SCHED_FIFO` where permitted.
 7. **Time.** Use `CLOCK_MONOTONIC` via TSC for latency and `CLOCK_REALTIME` (chrony-disciplined) for venue timestamps. Every event carries both.
 8. **Branch-predictable failure paths.** Risk rejects are cold paths marked `#[cold]`.
