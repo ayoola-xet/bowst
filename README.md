@@ -228,7 +228,7 @@ The strategy is a pure, deterministic module. v1 ships a proven baseline. Alpha 
 - **Startup sequence:** load config, then connect order entry and query all open orders, positions and balances over REST, then **cancel all unknown or open orders**, then subscribe to market data, build and validate books, then pass warm-up checks, then enable quoting instrument by instrument. The engine never trusts state from a previous run over venue truth.
 - **Continuous reconciliation:** every N seconds, compare internal positions, balances and open orders with the venue REST view. A small drift from in-flight messages is tolerated inside a time window. A persistent mismatch triggers the kill switch.
 - **Unknown order state** (timeout with no ack): mark it `Unknown`, count it against limits as if live, and query it by client order ID until resolved.
-- **Replay:** `bowst replay <journal>` reproduces a session bit-for-bit for post-mortems and regression tests.
+- **Replay:** a journal reproduces a session exactly for post-mortems and regression tests. Market data replays today with `bowst-md --replay <dir>` (ADR 0009); order and risk events join when those components are built.
 
 ---
 

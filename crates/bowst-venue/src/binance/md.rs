@@ -3,8 +3,8 @@
 //!
 //! Threads:
 //!
-//! - The **market-data thread** runs [`MdSession::run`]. It owns the WebSocket, the decoder
-//!   and every [`BookSync`], busy-polls the socket, and reports books and status changes to an
+//! - The **market-data thread** runs [`MdSession::run`]. It owns the WebSocket and the
+//!   books ([`MdBooks`]), busy-polls the socket, and reports books and status changes to an
 //!   [`MdHandler`].
 //! - A **snapshot thread** fetches REST depth snapshots on request, within a request-weight
 //!   budget, and honors `Retry-After`. A resync of one instrument therefore never stalls
@@ -26,10 +26,16 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bowst_book::{Book, BookSync, DeltaOutcome, Level, SyncConfig, SyncError};
-use bowst_core::{Instrument, InstrumentId, InstrumentTable, MonoTime, WallTime};
+use bowst_book::{Book, Level, SyncConfig};
+use bowst_core::{
+    Clock, Instrument, InstrumentId, InstrumentTable, MonoTime, SystemClock, VenueId, WallTime,
+};
+use bowst_journal::JournalProducer;
+use bowst_journal::format::{Kind, RecordHeader};
 
-use super::depth::{DepthSnapshotDecoder, DepthUpdateDecoder};
+use super::books::{MdBooks, SnapshotOutcome, index_of};
+use super::depth::DepthSnapshotDecoder;
+use super::replay::{BookSizing, describe};
 use super::rest::{RestError, depth_url, depth_weight, require_ok};
 use crate::backoff::Backoff;
 use crate::net::{NetError, TlsConfig, Url, http};
@@ -176,18 +182,17 @@ enum SnapshotState {
 #[derive(Debug)]
 pub struct MdSession<H> {
     config: MdConfig,
-    instruments: InstrumentTable,
     tls: TlsConfig,
     stream_url: Url,
-    syncs: Vec<BookSync>,
+    books: MdBooks,
     states: Vec<SnapshotState>,
-    decoder: DepthUpdateDecoder,
     jobs: Sender<SnapshotJob>,
     results: Receiver<SnapshotResult>,
     /// Incremented on every reconnect; snapshot results from older generations are ignored.
     generation: u64,
     handler: H,
-    stats: MdStats,
+    journal: Option<JournalProducer>,
+    clock: SystemClock,
 }
 
 impl<H: MdHandler> MdSession<H> {
@@ -213,11 +218,14 @@ impl<H: MdHandler> MdSession<H> {
             "{}/stream?streams={streams}",
             config.stream_url.trim_end_matches('/')
         ))?;
-        let syncs = instruments
-            .iter()
-            .map(|_| BookSync::new(config.sync))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| MdError::InvalidSizes)?;
+        let count = instruments.iter().len();
+        let books = MdBooks::new(
+            instruments,
+            config.sync,
+            config.max_levels_per_message,
+            usize::try_from(config.snapshot_limit).unwrap_or(usize::MAX),
+        )
+        .map_err(|()| MdError::InvalidSizes)?;
         let (jobs, job_rx) = mpsc::channel();
         let (result_tx, results) = mpsc::channel();
         let worker = SnapshotWorker {
@@ -232,25 +240,40 @@ impl<H: MdHandler> MdSession<H> {
             .spawn(move || worker.run(&job_rx, &result_tx))
             .map_err(|_| MdError::Spawn)?;
         Ok(Self {
-            states: vec![SnapshotState::Idle; syncs.len()],
-            decoder: DepthUpdateDecoder::new(config.max_levels_per_message),
+            states: vec![SnapshotState::Idle; count],
             config,
-            instruments,
             tls,
             stream_url,
-            syncs,
+            books,
             jobs,
             results,
             generation: 0,
             handler,
-            stats: MdStats::default(),
+            journal: None,
+            clock: SystemClock::new(),
         })
+    }
+
+    /// Journals everything this session receives: a session-start record describing the
+    /// instruments and sizing, then every raw message, applied snapshot, reset and status
+    /// change. The journal can be replayed with [`super::replay::replay`].
+    #[must_use]
+    pub fn with_journal(mut self, journal: JournalProducer) -> Self {
+        self.journal = Some(journal);
+        let sizing = BookSizing {
+            sync: self.config.sync,
+            max_levels_per_message: self.config.max_levels_per_message,
+            snapshot_limit: self.config.snapshot_limit,
+        };
+        let description = describe(&sizing, self.books.instruments());
+        self.record(Kind::SESSION_START, None, &[description.as_bytes()]);
+        self
     }
 
     /// Counters since the session started.
     #[must_use]
     pub fn stats(&self) -> MdStats {
-        self.stats
+        self.books.stats()
     }
 
     /// The handler, for inspection after [`run`](Self::run) returns.
@@ -258,11 +281,31 @@ impl<H: MdHandler> MdSession<H> {
         &self.handler
     }
 
+    /// Appends a journal record, if journaling is on. Never blocks: a full journal counts a drop.
+    fn record(&mut self, kind: Kind, wall: Option<WallTime>, parts: &[&[u8]]) {
+        if let Some(journal) = &mut self.journal {
+            let header = RecordHeader {
+                kind,
+                source: VenueId::Binance.code(),
+                mono: self.clock.mono(),
+                wall: wall.unwrap_or_else(|| self.clock.wall()),
+            };
+            journal.append(header, parts);
+        }
+    }
+
+    /// Reports a session-level status change to the handler and the journal.
+    fn status(&mut self, status: MdStatus) {
+        let text = format!("{status:?}");
+        self.record(Kind::MD_STATUS, None, &[text.as_bytes()]);
+        self.handler.on_status(status);
+    }
+
     /// Runs until `stop` is set: connect, stream, resync on gaps, reconnect on failure.
     pub fn run(&mut self, stop: &AtomicBool) {
         let mut backoff = Backoff::new(self.config.reconnect_initial, self.config.reconnect_max);
         while !stop.load(Ordering::Relaxed) {
-            self.handler.on_status(MdStatus::Connecting);
+            self.status(MdStatus::Connecting);
             let connected = WsClient::connect(
                 &self.stream_url,
                 &self.tls,
@@ -271,8 +314,9 @@ impl<H: MdHandler> MdSession<H> {
             );
             let reason = match connected {
                 Ok(mut client) => {
-                    self.stats.connections = self.stats.connections.saturating_add(1);
-                    self.handler.on_status(MdStatus::Connected);
+                    let stats = self.books.stats_mut();
+                    stats.connections = stats.connections.saturating_add(1);
+                    self.status(MdStatus::Connected);
                     let started = Instant::now();
                     let reason = self.stream(&mut client, stop);
                     client.close();
@@ -284,7 +328,7 @@ impl<H: MdHandler> MdSession<H> {
                 Err(err) => err.to_string(),
             };
             self.take_all_down();
-            self.handler.on_status(MdStatus::Disconnected { reason });
+            self.status(MdStatus::Disconnected { reason });
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -313,8 +357,17 @@ impl<H: MdHandler> MdSession<H> {
                 last_activity = Instant::now();
                 match event {
                     WsEvent::Text(message) | WsEvent::Binary(message) => {
-                        if let Err(reason) = self.on_message(message) {
-                            return reason;
+                        // Journaled exactly as received, before decoding, so even a message
+                        // that fails to decode is on record.
+                        self.record(Kind::MD_MESSAGE, None, &[message]);
+                        match self.books.on_message(message, &mut self.handler) {
+                            Ok(None) => {}
+                            Ok(Some(down)) => {
+                                if let Some(state) = self.states.get_mut(index_of(down)) {
+                                    *state = SnapshotState::Idle;
+                                }
+                            }
+                            Err(reason) => return reason,
                         }
                     }
                     WsEvent::Ping(payload) => {
@@ -355,65 +408,29 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
-    /// Decodes and applies one stream message. Hot path: no allocation on success.
-    fn on_message(&mut self, message: &[u8]) -> Result<(), String> {
-        self.stats.messages = self.stats.messages.saturating_add(1);
-        let update = match self.decoder.decode(message, &self.instruments) {
-            Ok(update) => update,
-            // Unattributable data means unknown state: drop the connection (all books resync).
-            Err(err) => return Err(format!("undecodable message: {err}")),
-        };
-        let index = index_of(update.instrument);
-        let Some(sync) = self.syncs.get_mut(index) else {
-            return Err("message for an unconfigured instrument".into());
-        };
-        match sync.on_delta(update.range, update.updates.iter().copied()) {
-            Ok(DeltaOutcome::Applied) => {
-                self.stats.deltas_applied = self.stats.deltas_applied.saturating_add(1);
-                if let Some(book) = sync.book() {
-                    self.handler
-                        .on_book(update.instrument, book, update.event_time);
-                }
-            }
-            Ok(DeltaOutcome::Buffered | DeltaOutcome::Stale) => {}
-            Err(err) => {
-                self.stats.book_invalidations = self.stats.book_invalidations.saturating_add(1);
-                if let Some(state) = self.states.get_mut(index) {
-                    *state = SnapshotState::Idle;
-                }
-                self.handler.on_status(MdStatus::InstrumentDown {
-                    instrument: update.instrument,
-                    reason: err.to_string(),
-                });
-            }
-        }
-        Ok(())
-    }
-
     fn request_snapshots(&mut self) {
         let now = Instant::now();
-        for (index, (sync, state)) in self.syncs.iter().zip(self.states.iter_mut()).enumerate() {
+        for (index, state) in self.states.iter_mut().enumerate() {
+            let id = id_of(index);
             let due = match *state {
                 SnapshotState::Idle => true,
                 SnapshotState::RetryAt(at) => now >= at,
                 SnapshotState::Requested => false,
             };
-            if sync.is_live() || !due {
+            if self.books.is_live(id) || !due {
                 continue;
             }
-            let Some(instrument) = self.instruments.get(id_of(index)) else {
+            let Some(instrument) = self.books.instruments().get(id).copied() else {
                 continue;
             };
-            if self
-                .jobs
-                .send(SnapshotJob {
-                    instrument: *instrument,
-                    generation: self.generation,
-                })
-                .is_ok()
-            {
+            let job = SnapshotJob {
+                instrument,
+                generation: self.generation,
+            };
+            if self.jobs.send(job).is_ok() {
                 *state = SnapshotState::Requested;
-                self.stats.snapshots_requested = self.stats.snapshots_requested.saturating_add(1);
+                let stats = self.books.stats_mut();
+                stats.snapshots_requested = stats.snapshots_requested.saturating_add(1);
             }
         }
     }
@@ -433,56 +450,55 @@ impl<H: MdHandler> MdSession<H> {
 
     fn apply_snapshot(&mut self, result: SnapshotResult) {
         let index = index_of(result.instrument);
-        let retry_at = later(self.config.snapshot_retry);
-        let (Some(sync), Some(state)) = (self.syncs.get_mut(index), self.states.get_mut(index))
-        else {
-            return;
-        };
         let snapshot = match result.outcome {
             Ok(snapshot) => snapshot,
             Err(failure) => {
                 let wait = failure.retry_after.map_or(self.config.snapshot_retry, |w| {
                     w.max(self.config.snapshot_retry)
                 });
-                *state = SnapshotState::RetryAt(later(wait));
-                self.handler.on_status(MdStatus::SnapshotFailed {
+                if let Some(state) = self.states.get_mut(index) {
+                    *state = SnapshotState::RetryAt(later(wait));
+                }
+                self.status(MdStatus::SnapshotFailed {
                     instrument: result.instrument,
                     reason: failure.reason,
                 });
                 return;
             }
         };
-        match sync.on_snapshot(snapshot.last_update_id, snapshot.bids, snapshot.asks) {
-            Ok(true) => {
-                *state = SnapshotState::Idle;
-                if let Some(book) = sync.book() {
-                    self.stats.snapshots_applied = self.stats.snapshots_applied.saturating_add(1);
-                    self.handler
-                        .on_status(MdStatus::InstrumentLive(result.instrument));
-                    self.handler
-                        .on_book(result.instrument, book, snapshot.fetched_at);
-                }
+        let id = result.instrument.get().to_le_bytes();
+        self.record(
+            Kind::MD_SNAPSHOT,
+            Some(snapshot.fetched_at),
+            &[&id, &snapshot.raw],
+        );
+        let outcome = self.books.on_snapshot(
+            result.instrument,
+            snapshot.last_update_id,
+            &snapshot.bids,
+            &snapshot.asks,
+            snapshot.fetched_at,
+            &mut self.handler,
+        );
+        let next = match outcome {
+            // `Unchanged`: older than the live book. `TooOld`: the stream has moved past it, so
+            // fetch a newer one right away. Either way the instrument is idle again.
+            SnapshotOutcome::Live | SnapshotOutcome::Unchanged | SnapshotOutcome::TooOld => {
+                SnapshotState::Idle
             }
-            // `Ok(false)`: older than the already-live book, so nothing changes (and no second
-            // "live" event). `SnapshotTooOld`: the stream has moved past it, so fetch a newer
-            // one right away. Either way the instrument is idle again.
-            Ok(false) | Err(SyncError::SnapshotTooOld { .. }) => *state = SnapshotState::Idle,
-            Err(err) => {
-                *state = SnapshotState::RetryAt(retry_at);
-                self.stats.book_invalidations = self.stats.book_invalidations.saturating_add(1);
-                self.handler.on_status(MdStatus::InstrumentDown {
-                    instrument: result.instrument,
-                    reason: err.to_string(),
-                });
-            }
+            SnapshotOutcome::Invalid => SnapshotState::RetryAt(later(self.config.snapshot_retry)),
+        };
+        if let Some(state) = self.states.get_mut(index) {
+            *state = next;
         }
     }
 
     /// Takes every book down after the connection ends.
     fn take_all_down(&mut self) {
+        self.record(Kind::MD_RESET, None, &[]);
         self.generation = self.generation.wrapping_add(1);
-        for (sync, state) in self.syncs.iter_mut().zip(self.states.iter_mut()) {
-            sync.reset();
+        self.books.reset_all();
+        for state in &mut self.states {
             *state = SnapshotState::Idle;
         }
     }
@@ -493,10 +509,6 @@ fn later(wait: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(wait)
         .unwrap_or_else(|| now.checked_add(Duration::from_secs(86_400)).unwrap_or(now))
-}
-
-fn index_of(id: InstrumentId) -> usize {
-    usize::try_from(id.get()).unwrap_or(usize::MAX)
 }
 
 fn id_of(index: usize) -> InstrumentId {
@@ -546,6 +558,8 @@ struct SnapshotResult {
 /// A decoded snapshot handed from the snapshot thread. Allocates, but only on the rare
 /// resync path.
 struct OwnedSnapshot {
+    /// The response body exactly as received, for the journal.
+    raw: Vec<u8>,
     last_update_id: u64,
     bids: Vec<Level>,
     asks: Vec<Level>,
@@ -568,8 +582,8 @@ struct SnapshotWorker {
 
 impl SnapshotWorker {
     fn run(self, jobs: &Receiver<SnapshotJob>, results: &Sender<SnapshotResult>) {
-        let clock = bowst_core::SystemClock::new();
-        let now = || bowst_core::Clock::mono(&clock);
+        let clock = SystemClock::new();
+        let now = || Clock::mono(&clock);
         let mut budget = TokenBucket::new(self.weight_per_minute, Duration::from_secs(60), now());
         let mut decoder = DepthSnapshotDecoder::new(usize::try_from(self.limit).unwrap_or(5_000));
         let (mut raw, mut body) = (Vec::new(), Vec::new());
@@ -643,8 +657,9 @@ impl SnapshotWorker {
         let snapshot = decoder
             .decode(body, instrument)
             .map_err(|e| failure(format!("decode: {e}")))?;
-        let fetched_at = bowst_core::Clock::wall(&bowst_core::SystemClock::new());
+        let fetched_at = Clock::wall(&SystemClock::new());
         Ok(OwnedSnapshot {
+            raw: body.clone(),
             last_update_id: snapshot.last_update_id,
             bids: snapshot.bids.to_vec(),
             asks: snapshot.asks.to_vec(),

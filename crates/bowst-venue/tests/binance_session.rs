@@ -379,6 +379,8 @@ type BestLevels = [Vec<(Dec, Dec)>; 2];
 struct Observed {
     statuses: Vec<MdStatus>,
     books: BTreeMap<u32, BestLevels>,
+    /// Every book update and instrument status change, in order, for replay comparison.
+    events: Vec<String>,
 }
 
 struct Recorder {
@@ -387,7 +389,7 @@ struct Recorder {
 }
 
 impl MdHandler for Recorder {
-    fn on_book(&mut self, instrument: InstrumentId, book: &Book, _event_time: WallTime) {
+    fn on_book(&mut self, instrument: InstrumentId, book: &Book, event_time: WallTime) {
         // Test-only: copies the top of the book on every update.
         let meta = self.instruments.get(instrument).unwrap();
         let levels = |side| -> Vec<(Dec, Dec)> {
@@ -398,15 +400,31 @@ impl MdHandler for Recorder {
                 .collect()
         };
         let top = [levels(Side::Buy), levels(Side::Sell)];
-        self.observed
-            .lock()
-            .unwrap()
-            .books
-            .insert(instrument.get(), top);
+        let event = format!(
+            "book {} {:?} {:?} {}/{} at {}",
+            instrument.get(),
+            top[0].first(),
+            top[1].first(),
+            book.side(Side::Buy).len(),
+            book.side(Side::Sell).len(),
+            event_time.as_nanos()
+        );
+        let mut observed = self.observed.lock().unwrap();
+        observed.books.insert(instrument.get(), top);
+        observed.events.push(event);
     }
 
     fn on_status(&mut self, status: MdStatus) {
-        self.observed.lock().unwrap().statuses.push(status);
+        let mut observed = self.observed.lock().unwrap();
+        // Instrument-level changes come from the shared book core, so replay reproduces them;
+        // connection-level ones are properties of the live session only.
+        if matches!(
+            status,
+            MdStatus::InstrumentLive(_) | MdStatus::InstrumentDown { .. }
+        ) {
+            observed.events.push(format!("{status:?}"));
+        }
+        observed.statuses.push(status);
     }
 }
 
@@ -440,6 +458,14 @@ struct Run {
 }
 
 fn start(faults: Faults, tweak: impl FnOnce(&mut MdConfig)) -> Run {
+    start_journaled(faults, tweak, None)
+}
+
+fn start_journaled(
+    faults: Faults,
+    tweak: impl FnOnce(&mut MdConfig),
+    journal: Option<bowst_journal::JournalProducer>,
+) -> Run {
     let (venue, ws_url, rest_url) = Venue::start(faults);
     let mut config = MdConfig::new(&ws_url, &rest_url);
     config.idle_sleep = Some(Duration::from_micros(200));
@@ -456,6 +482,9 @@ fn start(faults: Faults, tweak: impl FnOnce(&mut MdConfig)) -> Run {
     };
     let tls = TlsConfig::from_platform_roots().unwrap();
     let mut session = MdSession::new(config, instruments(), tls, recorder).unwrap();
+    if let Some(journal) = journal {
+        session = session.with_journal(journal);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let session = thread::spawn(move || {
@@ -676,4 +705,60 @@ fn unreachable_venue_is_retried_with_backoff() {
         observed.lock().unwrap().books.is_empty(),
         "no book is ever reported without a connection"
     );
+}
+
+#[test]
+fn journal_replays_the_live_session_exactly() {
+    let dir = std::env::temp_dir().join(format!("bowst-md-journal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (producer, journal) =
+        bowst_journal::start(bowst_journal::JournalConfig::new(&dir)).unwrap();
+
+    // A lost message and a mid-stream disconnect, so resyncs and resets are replayed too.
+    let frames = frames();
+    let victim = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.symbol == "BTCUSDT")
+        .nth(100)
+        .unwrap()
+        .0;
+    let faults = Faults {
+        drop_frame: Some(victim),
+        disconnect_after: Some(300),
+        ..Faults::default()
+    };
+    let run = start_journaled(faults, |_| {}, Some(producer));
+    run.converge();
+    let live = Arc::clone(&run.observed);
+    let (statuses, _, _) = run.finish();
+    assert!(
+        statuses
+            .iter()
+            .any(|s| matches!(s, MdStatus::InstrumentDown { .. })),
+        "gap exercised"
+    );
+    let journal_stats = journal.finish().unwrap();
+    assert_eq!(journal_stats.dropped, 0);
+
+    let replayed = Arc::new(Mutex::new(Observed::default()));
+    let mut recorder = Recorder {
+        observed: Arc::clone(&replayed),
+        instruments: instruments(),
+    };
+    let mut reader = bowst_journal::JournalReader::open(&dir).unwrap();
+    let report = bowst_venue::binance::replay::replay(&mut reader, &mut recorder).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(report.sessions, 1);
+    assert_eq!(report.dropped, 0);
+    assert!(!report.torn_tail);
+    assert!(report.resets >= 2, "disconnect and final stop: {report:?}");
+    let (live, replayed) = (live.lock().unwrap(), replayed.lock().unwrap());
+    assert!(live.events.len() > 300, "{}", live.events.len());
+    assert_eq!(live.events.len(), replayed.events.len());
+    for (i, (a, b)) in live.events.iter().zip(&replayed.events).enumerate() {
+        assert_eq!(a, b, "first difference at event {i}");
+    }
+    assert_eq!(live.books, replayed.books);
 }
