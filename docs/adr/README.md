@@ -10,6 +10,7 @@ Each significant architecture decision gets one short record here, numbered in o
 | [0004](0004-order-book-representation.md) | Order book as a sorted array with the best level last | Accepted |
 | [0005](0005-json-decoding.md) | In-house allocation-free JSON reader for venue messages | Accepted |
 | [0006](0006-websocket-protocol.md) | In-house client WebSocket protocol over a pre-allocated buffer | Accepted |
+| [0007](0007-tls-and-transport.md) | TLS via rustls with platform trust roots; minimal HTTP client for REST | Accepted |
 
 ## Template
 

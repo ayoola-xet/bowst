@@ -17,8 +17,8 @@ pub const MAX_RESPONSE_HEADERS: usize = 8 * 1024;
 /// Length of a base64-encoded 16-byte key.
 const KEY_LEN: usize = 24;
 
-/// Length of a base64-encoded SHA-1 digest.
-const ACCEPT_LEN: usize = 28;
+/// Length of a base64-encoded SHA-1 digest (the `Sec-WebSocket-Accept` value).
+pub const ACCEPT_LEN: usize = 28;
 
 /// One upgrade attempt: the random key and the accept value the server must echo.
 #[derive(Clone, Copy, Debug)]
@@ -33,11 +33,7 @@ impl Handshake {
     pub fn new(random: [u8; 16]) -> Self {
         let mut key = [0_u8; KEY_LEN];
         base64_encode(&random, &mut key);
-        let mut sha = sha1_smol::Sha1::new();
-        sha.update(&key);
-        sha.update(ACCEPT_GUID);
-        let mut accept = [0_u8; ACCEPT_LEN];
-        base64_encode(&sha.digest().bytes(), &mut accept);
+        let accept = accept_for_key(&key);
         Self { key, accept }
     }
 
@@ -125,6 +121,18 @@ impl Handshake {
             (true, true, true) => Ok(Some(header_len)),
         }
     }
+}
+
+/// The `Sec-WebSocket-Accept` value a server must return for `key` (RFC 6455 §4.2.2).
+/// Public so test servers can answer handshakes with the same logic.
+#[must_use]
+pub fn accept_for_key(key: &[u8]) -> [u8; ACCEPT_LEN] {
+    let mut sha = sha1_smol::Sha1::new();
+    sha.update(key);
+    sha.update(ACCEPT_GUID);
+    let mut accept = [0_u8; ACCEPT_LEN];
+    base64_encode(&sha.digest().bytes(), &mut accept);
+    accept
 }
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
