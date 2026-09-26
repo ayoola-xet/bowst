@@ -5,8 +5,13 @@
 //!
 //! ```text
 //! bowst-md [--symbols BTCUSDT,ETHUSDT] [--seconds 60] [--stream URL] [--rest URL] [--journal DIR]
+//!          [--metrics ADDR [--metrics-allow-remote]]
 //! bowst-md --replay DIR
 //! ```
+//!
+//! `--metrics ADDR` serves Prometheus metrics at `http://ADDR/metrics` (for example
+//! `127.0.0.1:9184`). Only loopback addresses are accepted unless `--metrics-allow-remote` is
+//! given: the endpoint has no authentication (see `docs/deploy/monitoring.md`).
 //!
 //! `--journal DIR` records the session (every raw message, applied snapshot and reset) for
 //! exact replay. `--replay DIR` replays a recorded journal through the same book logic and
@@ -22,7 +27,10 @@
 // Operator CLI: printing to the terminal is its purpose.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod metrics;
+
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,14 +39,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bowst_book::Book;
-use bowst_core::{Instrument, InstrumentId, InstrumentTable, Price, Qty, Symbol, WallTime};
-use bowst_journal::JournalReader;
+use bowst_core::{
+    Clock, Instrument, InstrumentId, InstrumentTable, Price, Qty, Symbol, SystemClock, WallTime,
+};
 use bowst_journal::format::Kind;
+use bowst_journal::{JournalHandle, JournalHealth, JournalReader};
 use bowst_telemetry::LatencySummary;
+use bowst_telemetry::server::{MetricsConfig, MetricsError, MetricsServer};
 use bowst_venue::binance::md::{MdConfig, MdHandler, MdReport, MdSession, MdStats, MdStatus};
 use bowst_venue::binance::replay::parse_description;
 use bowst_venue::binance::rest::load_instruments;
 use bowst_venue::net::TlsConfig;
+use metrics::MetricsState;
 
 const DEFAULT_STREAM: &str = "wss://data-stream.binance.vision";
 const DEFAULT_REST: &str = "https://data-api.binance.vision";
@@ -50,6 +62,8 @@ struct Args {
     rest: String,
     journal: Option<PathBuf>,
     replay: Option<PathBuf>,
+    metrics: Option<SocketAddr>,
+    metrics_allow_remote: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +74,8 @@ fn parse_args() -> Result<Args, String> {
         rest: DEFAULT_REST.into(),
         journal: None,
         replay: None,
+        metrics: None,
+        metrics_allow_remote: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -81,9 +97,17 @@ fn parse_args() -> Result<Args, String> {
             "--rest" => args.rest = value()?,
             "--journal" => args.journal = Some(value()?.into()),
             "--replay" => args.replay = Some(value()?.into()),
+            "--metrics" => {
+                args.metrics = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--metrics needs an address such as 127.0.0.1:9184")?,
+                );
+            }
+            "--metrics-allow-remote" => args.metrics_allow_remote = true,
             "-h" | "--help" => {
                 return Err(
-                    "usage: bowst-md [--symbols A,B] [--seconds N] [--stream URL] [--rest URL] [--journal DIR]\n       bowst-md --replay DIR"
+                    "usage: bowst-md [--symbols A,B] [--seconds N] [--stream URL] [--rest URL] [--journal DIR]\n                [--metrics ADDR [--metrics-allow-remote]]\n       bowst-md --replay DIR"
                         .into(),
                 );
             }
@@ -98,6 +122,7 @@ fn parse_args() -> Result<Args, String> {
 struct Board {
     tops: BTreeMap<u32, Top>,
     live: BTreeMap<u32, bool>,
+    metrics: MetricsState,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -158,15 +183,24 @@ impl MdHandler for Recorder {
             MdStatus::Disconnected { reason } => {
                 if let Ok(mut board) = self.board.lock() {
                     board.live.values_mut().for_each(|live| *live = false);
+                    board.metrics.connected = false;
                 }
                 println!("[status] disconnected: {reason}");
             }
             MdStatus::Connecting => println!("[status] connecting"),
-            MdStatus::Connected => println!("[status] connected"),
+            MdStatus::Connected => {
+                if let Ok(mut board) = self.board.lock() {
+                    board.metrics.connected = true;
+                }
+                println!("[status] connected");
+            }
         }
     }
 
     fn on_report(&mut self, report: &MdReport) {
+        if let Ok(mut board) = self.board.lock() {
+            board.metrics.report = Some((*report, SystemClock::new().wall()));
+        }
         let messages = report.stats.messages.saturating_sub(self.reported_messages);
         self.reported_messages = report.stats.messages;
         println!(
@@ -324,13 +358,21 @@ fn watch(
     board: &Mutex<Board>,
     instruments: &InstrumentTable,
     duration: Duration,
+    journal: Option<&JournalHandle>,
 ) -> BTreeMap<u32, bool> {
     let started = Instant::now();
     let mut previous = BTreeMap::new();
     let mut ever_live = BTreeMap::new();
     while started.elapsed() < duration {
         thread::sleep(Duration::from_secs(1));
-        if let Ok(board) = board.lock() {
+        if let Ok(mut board) = board.lock() {
+            if let Some(journal) = journal {
+                let health = journal.health();
+                board.metrics.journal = Some(health);
+                if let JournalHealth::Degraded { dropped } = health {
+                    board.metrics.journal_dropped = dropped;
+                }
+            }
             println!("--- {:>4}s", started.elapsed().as_secs());
             print_board(&board, instruments, &mut previous);
             for (id, live) in &board.live {
@@ -382,8 +424,35 @@ fn print_summary(stats: &MdStats, latency: &LatencySummary) {
     );
 }
 
+/// Serves Prometheus metrics when `--metrics` was given. The server stops when the returned
+/// value is dropped.
+fn start_metrics(
+    args: &Args,
+    board: &Arc<Mutex<Board>>,
+    instruments: &InstrumentTable,
+) -> Result<Option<MetricsServer>, MetricsError> {
+    let Some(addr) = args.metrics else {
+        return Ok(None);
+    };
+    let mut config = MetricsConfig::new(addr);
+    config.allow_remote = args.metrics_allow_remote;
+    let (board, instruments) = (Arc::clone(board), instruments.clone());
+    let server = MetricsServer::start(config, move || {
+        board.lock().map_or_else(
+            |_| String::new(),
+            |board| {
+                metrics::render(&board.metrics, &instruments, |id| {
+                    board.live.get(&id).copied().unwrap_or(false)
+                })
+            },
+        )
+    })?;
+    println!("serving metrics at http://{}/metrics", server.addr());
+    Ok(Some(server))
+}
+
 /// Flushes and closes the journal, printing its statistics. `false` if it failed.
-fn finish_journal(handle: bowst_journal::JournalHandle) -> bool {
+fn finish_journal(handle: JournalHandle) -> bool {
     println!("journal health: {:?}", handle.health());
     match handle.finish() {
         Ok(stats) => {
@@ -400,6 +469,33 @@ fn finish_journal(handle: bowst_journal::JournalHandle) -> bool {
     }
 }
 
+/// TLS roots and the instruments' rules from the venue. Prints what went wrong on failure.
+fn connect_setup(args: &Args) -> Option<(TlsConfig, InstrumentTable)> {
+    let tls = match TlsConfig::from_platform_roots() {
+        Ok(tls) => tls,
+        Err(e) => {
+            eprintln!("TLS setup failed: {e}");
+            return None;
+        }
+    };
+    let instruments =
+        match load_instruments(&args.rest, &args.symbols, &tls, Duration::from_secs(10)) {
+            Ok(instruments) => instruments,
+            Err(e) => {
+                eprintln!("could not load instruments: {e}");
+                return None;
+            }
+        };
+    for i in instruments.iter() {
+        println!(
+            "{}: tick {} lot {} min notional {}",
+            i.symbol, i.tick, i.lot, i.min_notional
+        );
+    }
+
+    Some((tls, instruments))
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -411,29 +507,21 @@ fn main() -> ExitCode {
     if let Some(dir) = &args.replay {
         return replay_journal(dir);
     }
-    let tls = match TlsConfig::from_platform_roots() {
-        Ok(tls) => tls,
+    let Some((tls, instruments)) = connect_setup(&args) else {
+        return ExitCode::FAILURE;
+    };
+
+    let board = Arc::new(Mutex::new(Board::default()));
+    if let Ok(mut board) = board.lock() {
+        board.metrics.started = SystemClock::new().wall();
+    }
+    let _metrics = match start_metrics(&args, &board, &instruments) {
+        Ok(server) => server,
         Err(e) => {
-            eprintln!("TLS setup failed: {e}");
+            eprintln!("could not serve metrics: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let instruments =
-        match load_instruments(&args.rest, &args.symbols, &tls, Duration::from_secs(10)) {
-            Ok(instruments) => instruments,
-            Err(e) => {
-                eprintln!("could not load instruments: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-    for i in instruments.iter() {
-        println!(
-            "{}: tick {} lot {} min notional {}",
-            i.symbol, i.tick, i.lot, i.min_notional
-        );
-    }
-
-    let board = Arc::new(Mutex::new(Board::default()));
     let recorder = Recorder {
         board: Arc::clone(&board),
         symbols: args.symbols.clone(),
@@ -474,7 +562,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let ever_live = watch(&board, &instruments, Duration::from_secs(args.seconds));
+    let ever_live = watch(
+        &board,
+        &instruments,
+        Duration::from_secs(args.seconds),
+        journal.as_ref(),
+    );
     stop.store(true, Ordering::Relaxed);
     let Ok((stats, latency)) = md.join() else {
         eprintln!("market-data thread panicked");
@@ -589,6 +682,7 @@ mod tests {
         assert_eq!(latency_text(&LatencySummary::default()), "no samples");
         let summary = LatencySummary {
             count: 3,
+            sum: 76_900,
             min: 900,
             p50: 1_000,
             p90: 2_000,
