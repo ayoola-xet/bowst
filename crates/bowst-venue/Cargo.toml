@@ -12,6 +12,7 @@ repository.workspace = true
 bowst-book.workspace = true
 bowst-core.workspace = true
 bowst-journal.workspace = true
+bowst-telemetry.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 sha1_smol.workspace = true
@@ -23,6 +24,10 @@ proptest.workspace = true
 
 [[bench]]
 name = "decode"
+harness = false
+
+[[bench]]
+name = "md_books"
 harness = false
 
 [lints]

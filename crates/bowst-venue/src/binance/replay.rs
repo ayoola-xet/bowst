@@ -3,8 +3,9 @@
 //!
 //! A journal is self-describing: each session starts with a [`Kind::SESSION_START`] record
 //! holding the instrument rules and sizing that affect book behavior (see [`describe`]). Replay
-//! then feeds every journaled message, snapshot and reset to [`MdBooks`] in order, so the
-//! handler sees exactly the books and status changes the live session produced.
+//! then feeds every journaled message, snapshot, verification and reset to [`MdBooks`] in
+//! order, so the handler sees exactly the books and status changes the live session produced,
+//! including any verification mismatch.
 
 use core::fmt::Write as _;
 
@@ -117,7 +118,7 @@ pub enum ReplayError {
     /// A session-start record could not be parsed.
     #[error("unreadable session description: {0:?}")]
     BadSession(String),
-    /// A snapshot record is shorter than its instrument ID.
+    /// A snapshot or verification record is shorter than its instrument ID.
     #[error("malformed snapshot record")]
     BadSnapshot,
     /// The books could not be allocated with the recorded sizing.
@@ -134,6 +135,8 @@ pub struct ReplayReport {
     pub messages: u64,
     /// Snapshots replayed.
     pub snapshots: u64,
+    /// Verification snapshots replayed.
+    pub verifications: u64,
     /// Connection resets replayed.
     pub resets: u64,
     /// Records the live session failed to journal (from gap markers). Non-zero means the
@@ -189,6 +192,24 @@ pub fn replay(
                 let instrument = InstrumentId::new(u32::from_le_bytes(*id));
                 books.on_raw_snapshot(instrument, body, header.wall, handler);
                 report.snapshots = report.snapshots.saturating_add(1);
+            }
+            Kind::MD_VERIFY_START => {
+                let books = books.as_mut().ok_or(ReplayError::NoSession)?;
+                let id = record
+                    .payload
+                    .first_chunk::<4>()
+                    .ok_or(ReplayError::BadSnapshot)?;
+                books.start_verification(InstrumentId::new(u32::from_le_bytes(*id)));
+            }
+            Kind::MD_VERIFY_SNAPSHOT => {
+                let books = books.as_mut().ok_or(ReplayError::NoSession)?;
+                let (id, body) = record
+                    .payload
+                    .split_first_chunk::<4>()
+                    .ok_or(ReplayError::BadSnapshot)?;
+                let instrument = InstrumentId::new(u32::from_le_bytes(*id));
+                books.on_raw_verification_snapshot(instrument, body, handler);
+                report.verifications = report.verifications.saturating_add(1);
             }
             Kind::MD_RESET => {
                 books.as_mut().ok_or(ReplayError::NoSession)?.reset_all();

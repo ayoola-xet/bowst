@@ -12,9 +12,12 @@
 //! exact replay. `--replay DIR` replays a recorded journal through the same book logic and
 //! prints the final books and a report.
 //!
+//! Every 10 seconds it prints a `[stats]` line: messages, decode-and-apply latency percentiles,
+//! and the results of verifying books against fresh snapshots (one instrument per minute).
+//!
 //! Defaults point at Binance's public market-data endpoints (`data-stream.binance.vision`,
 //! `data-api.binance.vision`), which serve public data only. The exit code is non-zero if any
-//! instrument never went live.
+//! instrument never went live, or if any book failed verification.
 
 // Operator CLI: printing to the terminal is its purpose.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -31,7 +34,8 @@ use bowst_book::Book;
 use bowst_core::{Instrument, InstrumentId, InstrumentTable, Price, Qty, Symbol, WallTime};
 use bowst_journal::JournalReader;
 use bowst_journal::format::Kind;
-use bowst_venue::binance::md::{MdConfig, MdHandler, MdSession, MdStatus};
+use bowst_telemetry::LatencySummary;
+use bowst_venue::binance::md::{MdConfig, MdHandler, MdReport, MdSession, MdStats, MdStatus};
 use bowst_venue::binance::replay::parse_description;
 use bowst_venue::binance::rest::load_instruments;
 use bowst_venue::net::TlsConfig;
@@ -110,6 +114,8 @@ struct Top {
 struct Recorder {
     board: Arc<Mutex<Board>>,
     symbols: Vec<Symbol>,
+    /// Messages counted at the previous report.
+    reported_messages: u64,
 }
 
 impl MdHandler for Recorder {
@@ -158,6 +164,19 @@ impl MdHandler for Recorder {
             MdStatus::Connecting => println!("[status] connecting"),
             MdStatus::Connected => println!("[status] connected"),
         }
+    }
+
+    fn on_report(&mut self, report: &MdReport) {
+        let messages = report.stats.messages.saturating_sub(self.reported_messages);
+        self.reported_messages = report.stats.messages;
+        println!(
+            "[stats] {}s: {messages} msgs, decode+apply {}; verified {} ok, {} mismatched, {} abandoned",
+            report.interval.as_secs(),
+            latency_text(&report.latency),
+            report.stats.verifications_passed,
+            report.stats.verification_mismatches,
+            report.stats.verifications_abandoned,
+        );
     }
 }
 
@@ -259,6 +278,7 @@ fn replay_journal(dir: &Path) -> ExitCode {
     let mut recorder = Recorder {
         board: Arc::clone(&board),
         symbols: instruments.iter().map(|i| i.symbol).collect(),
+        reported_messages: 0,
     };
     let report = match bowst_venue::binance::replay::replay(&mut reader, &mut recorder) {
         Ok(report) => report,
@@ -268,10 +288,11 @@ fn replay_journal(dir: &Path) -> ExitCode {
         }
     };
     println!(
-        "replayed {} session(s): {} messages, {} snapshots, {} resets, {} records missing{}",
+        "replayed {} session(s): {} messages, {} snapshots, {} verification snapshots, {} resets, {} records missing{}",
         report.sessions,
         report.messages,
         report.snapshots,
+        report.verifications,
         report.resets,
         report.dropped,
         if report.torn_tail {
@@ -320,6 +341,45 @@ fn watch(
         }
     }
     ever_live
+}
+
+/// Nanoseconds as microseconds with two decimals, without floating point.
+fn micros(nanos: u64) -> String {
+    format!("{}.{:02} µs", nanos / 1_000, nanos % 1_000 / 10)
+}
+
+fn latency_text(latency: &LatencySummary) -> String {
+    if latency.count == 0 {
+        return "no samples".into();
+    }
+    format!(
+        "p50 {} p99 {} p99.9 {} max {}",
+        micros(latency.p50),
+        micros(latency.p99),
+        micros(latency.p999),
+        micros(latency.max)
+    )
+}
+
+fn print_summary(stats: &MdStats, latency: &LatencySummary) {
+    println!(
+        "summary: {} messages, {} deltas applied, {} book invalidations, {} connections, {}/{} snapshots applied/requested",
+        stats.messages,
+        stats.deltas_applied,
+        stats.book_invalidations,
+        stats.connections,
+        stats.snapshots_applied,
+        stats.snapshots_requested
+    );
+    println!(
+        "latency: decode+apply over {} messages: {}",
+        latency.count,
+        latency_text(latency)
+    );
+    println!(
+        "verification: {} passed, {} mismatched, {} abandoned",
+        stats.verifications_passed, stats.verification_mismatches, stats.verifications_abandoned
+    );
 }
 
 /// Flushes and closes the journal, printing its statistics. `false` if it failed.
@@ -377,6 +437,7 @@ fn main() -> ExitCode {
     let recorder = Recorder {
         board: Arc::clone(&board),
         symbols: args.symbols.clone(),
+        reported_messages: 0,
     };
     let mut config = MdConfig::new(&args.stream, &args.rest);
     // A shared machine: sleep briefly when idle instead of spinning a core.
@@ -406,7 +467,7 @@ fn main() -> ExitCode {
     let flag = Arc::clone(&stop);
     let md = thread::Builder::new().name("md".into()).spawn(move || {
         session.run(&flag);
-        session.stats()
+        (session.stats(), session.latency())
     });
     let Ok(md) = md else {
         eprintln!("could not start the market-data thread");
@@ -415,7 +476,7 @@ fn main() -> ExitCode {
 
     let ever_live = watch(&board, &instruments, Duration::from_secs(args.seconds));
     stop.store(true, Ordering::Relaxed);
-    let Ok(stats) = md.join() else {
+    let Ok((stats, latency)) = md.join() else {
         eprintln!("market-data thread panicked");
         return ExitCode::FAILURE;
     };
@@ -424,15 +485,13 @@ fn main() -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    println!(
-        "summary: {} messages, {} deltas applied, {} book invalidations, {} connections, {}/{} snapshots applied/requested",
-        stats.messages,
-        stats.deltas_applied,
-        stats.book_invalidations,
-        stats.connections,
-        stats.snapshots_applied,
-        stats.snapshots_requested
-    );
+    print_summary(&stats, &latency);
+    if stats.verification_mismatches > 0 {
+        eprintln!(
+            "a book differed from a fresh venue snapshot: investigate before trusting this build"
+        );
+        return ExitCode::FAILURE;
+    }
     if ever_live.len() == instruments.iter().len() {
         ExitCode::SUCCESS
     } else {
@@ -519,6 +578,27 @@ mod tests {
         assert!(
             line.contains("spread    1 ticks  depth 1185/943  159 updates"),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn latency_is_shown_in_microseconds_without_floats() {
+        assert_eq!(micros(0), "0.00 µs");
+        assert_eq!(micros(1_234), "1.23 µs");
+        assert_eq!(micros(12_005), "12.00 µs");
+        assert_eq!(latency_text(&LatencySummary::default()), "no samples");
+        let summary = LatencySummary {
+            count: 3,
+            min: 900,
+            p50: 1_000,
+            p90: 2_000,
+            p99: 4_990,
+            p999: 5_000,
+            max: 70_000,
+        };
+        assert_eq!(
+            latency_text(&summary),
+            "p50 1.00 µs p99 4.99 µs p99.9 5.00 µs max 70.00 µs"
         );
     }
 

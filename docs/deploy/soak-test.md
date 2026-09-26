@@ -9,10 +9,10 @@ Phase 1 exit criteria (README §15) and how this run covers them:
 | Criterion | Covered by this run? |
 |---|---|
 | 72 h continuous run with zero undetected gaps | **Yes.** Every gap is detected by sequence bridging, reported as `DOWN`, and resynchronized. The journal lets any incident be replayed exactly. |
-| Book matches venue snapshots | **Partly.** Every resync validates against a fresh snapshot. Periodic shadow-snapshot comparison is not built yet. |
-| Decode + book update < 5 µs p99 | **No.** Latency histograms arrive with the telemetry work. Numbers from a shared VM would not count anyway. |
+| Book matches venue snapshots | **Yes.** Once a minute, one book (in turn) is rebuilt from a fresh snapshot and compared with the live book, 100 levels per side (ADR 0010). |
+| Decode + book update < 5 µs p99 | **Measured, not settled.** Every message is timed and reported every 10 s. The target itself is under review (README §15), and numbers from a shared or sleeping machine overstate it. |
 
-So this run is worth doing now: it shakes out connection-lifecycle, resync and journal problems over days rather than seconds. It is repeated once telemetry lands.
+It shakes out connection-lifecycle, resync, verification and journal problems over days rather than seconds.
 
 ## 1. Legal check (before choosing where)
 
@@ -167,6 +167,8 @@ The run passes when:
 - [ ] Replay exits 0, reports `0 records missing`, and does not report a torn final record.
 - [ ] Every `DOWN` in `soak.log` is followed by `live` for the same instrument, and each has an explanation (a detected gap, a reconnect or a venue incident).
 - [ ] The summary reports 4 connections (a planned reconnect every 23 hours), plus one for each explained disconnect.
+- [ ] The `verification:` summary line shows `0 mismatched`, and `passed` is close to one per minute of run time (about 4,300 over 72 hours, fewer for time spent reconnecting). Any mismatch fails the run; see the runbook.
+- [ ] The `latency:` summary line is recorded with the results. It is compared with the Phase 1 target once that target is settled (README §15); a shared or sleeping machine overstates it.
 
 Record the commit hash, instance type, region, pairs, start and end times, and these results in the PR or issue that closes Phase 1.
 
