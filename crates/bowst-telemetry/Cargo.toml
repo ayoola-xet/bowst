@@ -1,6 +1,6 @@
 [package]
-name = "bowst-md"
-description = "Operator tool: stream live Binance Spot order books and report their health."
+name = "bowst-telemetry"
+description = "Allocation-free latency histograms and counters for Bowst."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,15 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
-bowst-book.workspace = true
+
+[dev-dependencies]
 bowst-core.workspace = true
-bowst-journal.workspace = true
-bowst-telemetry.workspace = true
-bowst-venue.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "histogram"
+harness = false
 
 [lints]
 workspace = true

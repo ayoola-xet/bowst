@@ -9,10 +9,10 @@ Phase 1 exit criteria (README §15) and how this run covers them:
 | Criterion | Covered by this run? |
 |---|---|
 | 72 h continuous run with zero undetected gaps | **Yes.** Every gap is detected by sequence bridging, reported as `DOWN`, and resynchronized. The journal lets any incident be replayed exactly. |
-| Book matches venue snapshots | **Partly.** Every resync validates against a fresh snapshot. Periodic shadow-snapshot comparison is not built yet. |
-| Decode + book update < 5 µs p99 | **No.** Latency histograms arrive with the telemetry work. Numbers from a shared VM would not count anyway. |
+| Book matches venue snapshots | **Yes.** Once a minute, one book (in turn) is rebuilt from a fresh snapshot and compared with the live book, 100 levels per side (ADR 0010). |
+| Decode + book update < 5 µs p99 | **Measured, not settled.** Every message is timed and reported every 10 s. The target itself is under review (README §15), and numbers from a shared or sleeping machine overstate it. |
 
-So this run is worth doing now: it shakes out connection-lifecycle, resync and journal problems over days rather than seconds. It is repeated once telemetry lands.
+It shakes out connection-lifecycle, resync, verification and journal problems over days rather than seconds.
 
 ## 1. Legal check (before choosing where)
 
@@ -31,7 +31,22 @@ Read README §17, item 6. Where the server sits does not decide whether the busi
 
 **Cost:** an instance of this size is roughly USD 0.10 per hour, so a 72-hour run costs on the order of USD 10 plus disk. Check current pricing for your account.
 
-**Disk sizing:** a 20-second test with BTCUSDT and ETHUSDT wrote about 330 KB of journal, which is roughly 1.5 GB per day for those two pairs. Busier pairs or more of them scale that up. Budget about 3 GB per pair for 72 hours, and keep at least 30% of the disk free.
+**Disk sizing:** a real run with BTCUSDT, ETHUSDT and SOLUSDT wrote about 140 MB of journal per hour, roughly 50 MB per pair per hour, or 3.5 GB per pair over 72 hours. Volume rises with market activity, so budget 5 GB per pair and keep at least 30% of the disk free.
+
+**Low-cost alternatives.** This run only reads public data, and latency figures from a shared or burstable machine are indicative only, so any always-on machine works:
+
+- A free-tier cloud VM (for example Oracle Cloud's Always Free ARM instances), or a small VPS billed by the hour (Vultr, DigitalOcean, Hetzner), about USD 1–2 for 72 hours. Pick at least 2 GB of RAM, or add swap before building, because the optimized release build needs the memory.
+- A computer you already have. On macOS, which has no systemd, run the tool in the foreground and keep the machine awake:
+
+  ```sh
+  mkdir -p ~/bowst-soak
+  caffeinate -i ./target/release/bowst-md --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --seconds 259200 --journal ~/bowst-soak/journal > ~/bowst-soak/soak.log 2>&1
+  ```
+
+  Keep it plugged in with the lid open, and use a directory in your home folder: macOS clears `/tmp`. Do not rebuild or `git pull` in that checkout during the run. Replacing a running binary can get the process killed; use a second clone for development.
+
+Home network drops are fine: they exercise reconnection and resynchronization, which is part of what the run tests.
 
 ## 3. Build
 
@@ -120,10 +135,16 @@ systemctl status bowst-md-soak                       # still running?
 journalctl -u bowst-md-soak -f                       # live board
 journalctl -u bowst-md-soak | grep '\[status\]'      # every lifecycle event
 du -sh /var/lib/bowst/journal && df -h /var/lib/bowst
+
+# Each status line with the elapsed time of the board line before it:
+journalctl -u bowst-md-soak -o cat | awk '/^---/{t=$2} /\[status\]/{print t, $0}'
 ```
+
+On a machine without systemd, read `soak.log` with the same `grep` and `awk` commands.
 
 Expected events:
 - **Every 23 hours:** a planned disconnect and reconnect (`disconnected: connection reached its maximum age`). Binance closes connections at 24 hours, so the session reconnects first, on its own schedule. The seamless handover that removes this gap is a known follow-up (ADR 0008).
+- **Occasional `disconnected: connection closed by peer`, then `connecting`, `connected` and every pair `live` again:** the network connection ended without a WebSocket close frame. This is typically a router, ISP or venue load balancer dropping a long-lived connection. Reconnection with fresh snapshots is the correct response.
 - **Occasional `DOWN` followed by `live`:** a sequence gap that was detected and resynchronized. This is the system working. The runbook (`docs/runbooks/market-data.md`) explains each status.
 
 Investigate any of these:
@@ -146,6 +167,8 @@ The run passes when:
 - [ ] Replay exits 0, reports `0 records missing`, and does not report a torn final record.
 - [ ] Every `DOWN` in `soak.log` is followed by `live` for the same instrument, and each has an explanation (a detected gap, a reconnect or a venue incident).
 - [ ] The summary reports 4 connections (a planned reconnect every 23 hours), plus one for each explained disconnect.
+- [ ] The `verification:` summary line shows `0 mismatched`, and `passed` is close to one per minute of run time (about 4,300 over 72 hours, fewer for time spent reconnecting). Any mismatch fails the run; see the runbook.
+- [ ] The `latency:` summary line is recorded with the results. It is compared with the Phase 1 target once that target is settled (README §15); a shared or sleeping machine overstates it.
 
 Record the commit hash, instance type, region, pairs, start and end times, and these results in the PR or issue that closes Phase 1.
 

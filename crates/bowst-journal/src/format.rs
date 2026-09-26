@@ -57,6 +57,12 @@ impl Kind {
     pub const MD_STATUS: Self = Self(0x0102);
     /// The market-data connection ended and every book was reset. No payload. Source: venue ID.
     pub const MD_RESET: Self = Self(0x0103);
+    /// Verification of one instrument's book started: its deltas now also feed a verification
+    /// book. Payload: instrument ID (`u32`). Source: venue ID.
+    pub const MD_VERIFY_START: Self = Self(0x0104);
+    /// A raw REST depth snapshot loaded into the verification book. Payload: instrument ID
+    /// (`u32`) then the raw response body. Source: venue ID.
+    pub const MD_VERIFY_SNAPSHOT: Self = Self(0x0105);
 }
 
 /// A record's header fields (the checksum is handled by the writer and reader).

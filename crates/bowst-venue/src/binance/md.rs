@@ -20,6 +20,11 @@
 //!   exponential backoff.
 //! - Snapshot results from before a reconnect are discarded, so a stale snapshot can never be
 //!   applied to a new stream.
+//! - Every `verify_every`, one live instrument's book (in turn) is checked against a book
+//!   rebuilt from a fresh snapshot (see [`super::books`]). A difference takes the book down.
+//!
+//! Telemetry: the time to decode and apply each message is recorded in a histogram, and every
+//! `report_every` the handler receives an [`MdReport`] with counters and latency percentiles.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -32,8 +37,9 @@ use bowst_core::{
 };
 use bowst_journal::JournalProducer;
 use bowst_journal::format::{Kind, RecordHeader};
+use bowst_telemetry::{LatencyHistogram, LatencySummary};
 
-use super::books::{MdBooks, SnapshotOutcome, index_of};
+use super::books::{Applied, DownReason, MdBooks, SnapshotOutcome, Verification, index_of};
 use super::depth::DepthSnapshotDecoder;
 use super::replay::{BookSizing, describe};
 use super::rest::{RestError, depth_url, depth_weight, require_ok};
@@ -79,6 +85,13 @@ pub struct MdConfig {
     /// `None` busy-polls the socket (production, on an isolated core). `Some` sleeps this long
     /// when no data is waiting (tools and tests on shared machines).
     pub idle_sleep: Option<Duration>,
+    /// Verify one live book against a fresh snapshot this often, taking instruments in turn.
+    /// `None` disables verification.
+    pub verify_every: Option<Duration>,
+    /// Abandon a verification whose snapshot has not produced a verdict within this time.
+    pub verify_timeout: Duration,
+    /// Send the handler an [`MdReport`] this often.
+    pub report_every: Duration,
 }
 
 impl MdConfig {
@@ -109,6 +122,9 @@ impl MdConfig {
             snapshot_retry: Duration::from_secs(2),
             rest_weight_per_minute: 1_200,
             idle_sleep: None,
+            verify_every: Some(Duration::from_secs(60)),
+            verify_timeout: Duration::from_secs(30),
+            report_every: Duration::from_secs(10),
         }
     }
 }
@@ -149,6 +165,22 @@ pub trait MdHandler {
     fn on_book(&mut self, instrument: InstrumentId, book: &Book, event_time: WallTime);
     /// Session or instrument state changed. Rare; may log.
     fn on_status(&mut self, status: MdStatus);
+    /// Periodic counters and latency, every `report_every`. May log. Ignored by default.
+    fn on_report(&mut self, report: &MdReport) {
+        let _ = report;
+    }
+}
+
+/// Periodic telemetry from the session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MdReport {
+    /// Time covered by `latency`.
+    pub interval: Duration,
+    /// Counters since the session started.
+    pub stats: MdStats,
+    /// Time to decode one message and apply it to its book, over the interval, in
+    /// nanoseconds. Excludes journaling and the handler.
+    pub latency: LatencySummary,
 }
 
 /// Counters since the session started.
@@ -166,6 +198,12 @@ pub struct MdStats {
     pub snapshots_requested: u64,
     /// Snapshots that brought a book live.
     pub snapshots_applied: u64,
+    /// Verifications that found the live book identical to one rebuilt from a snapshot.
+    pub verifications_passed: u64,
+    /// Verifications that found a difference (each took the book down).
+    pub verification_mismatches: u64,
+    /// Verifications abandoned without a verdict (unusable snapshot, timeout or reconnect).
+    pub verifications_abandoned: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +231,17 @@ pub struct MdSession<H> {
     handler: H,
     journal: Option<JournalProducer>,
     clock: SystemClock,
+    /// Decode-and-apply latency since the last report.
+    interval_latency: LatencyHistogram,
+    /// Decode-and-apply latency since the session started.
+    total_latency: LatencyHistogram,
+    /// The verification in progress (instrument and when it started) and the next one due.
+    verification: Option<(InstrumentId, Instant)>,
+    next_verification: Instant,
+    /// Index of the instrument to verify next.
+    verify_cursor: usize,
+    /// When the current report interval began.
+    report_started: Instant,
 }
 
 impl<H: MdHandler> MdSession<H> {
@@ -251,6 +300,12 @@ impl<H: MdHandler> MdSession<H> {
             handler,
             journal: None,
             clock: SystemClock::new(),
+            interval_latency: LatencyHistogram::new(),
+            total_latency: LatencyHistogram::new(),
+            verification: None,
+            next_verification: Instant::now(),
+            verify_cursor: 0,
+            report_started: Instant::now(),
         })
     }
 
@@ -274,6 +329,12 @@ impl<H: MdHandler> MdSession<H> {
     #[must_use]
     pub fn stats(&self) -> MdStats {
         self.books.stats()
+    }
+
+    /// Decode-and-apply latency since the session started, in nanoseconds.
+    #[must_use]
+    pub fn latency(&self) -> LatencySummary {
+        self.total_latency.summary()
     }
 
     /// The handler, for inspection after [`run`](Self::run) returns.
@@ -360,13 +421,13 @@ impl<H: MdHandler> MdSession<H> {
                         // Journaled exactly as received, before decoding, so even a message
                         // that fails to decode is on record.
                         self.record(Kind::MD_MESSAGE, None, &[message]);
-                        match self.books.on_message(message, &mut self.handler) {
-                            Ok(None) => {}
-                            Ok(Some(down)) => {
-                                if let Some(state) = self.states.get_mut(index_of(down)) {
-                                    *state = SnapshotState::Idle;
-                                }
-                            }
+                        let started = Instant::now();
+                        let applied = self.books.apply(message);
+                        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        self.interval_latency.record(nanos);
+                        self.total_latency.record(nanos);
+                        match applied {
+                            Ok(applied) => self.after_apply(applied),
                             Err(reason) => return reason,
                         }
                     }
@@ -389,6 +450,8 @@ impl<H: MdHandler> MdSession<H> {
             }
             self.collect_snapshots();
             self.request_snapshots();
+            self.schedule_verification();
+            self.maybe_report();
 
             let now = Instant::now();
             if now.duration_since(last_activity) >= self.config.stale_after {
@@ -426,6 +489,7 @@ impl<H: MdHandler> MdSession<H> {
             let job = SnapshotJob {
                 instrument,
                 generation: self.generation,
+                purpose: Purpose::Sync,
             };
             if self.jobs.send(job).is_ok() {
                 *state = SnapshotState::Requested;
@@ -444,7 +508,10 @@ impl<H: MdHandler> MdSession<H> {
             if result.generation != self.generation {
                 continue; // Fetched for a previous connection.
             }
-            self.apply_snapshot(result);
+            match result.purpose {
+                Purpose::Sync => self.apply_snapshot(result),
+                Purpose::Verify => self.apply_verification_snapshot(result),
+            }
         }
     }
 
@@ -498,9 +565,147 @@ impl<H: MdHandler> MdSession<H> {
         self.record(Kind::MD_RESET, None, &[]);
         self.generation = self.generation.wrapping_add(1);
         self.books.reset_all();
+        if self.verification.take().is_some() {
+            self.count_abandoned();
+        }
         for state in &mut self.states {
             *state = SnapshotState::Idle;
         }
+    }
+
+    /// Reports an applied message to the handler and schedules a resync if a book went down.
+    fn after_apply(&mut self, applied: Applied) {
+        self.books.report(applied, &mut self.handler);
+        if let Some((id, _)) = self.verification
+            && self.books.verifying() != Some(id)
+        {
+            // The verification ended on this message: either compared (the books counted the
+            // verdict) or cancelled because the live book hit a gap.
+            if matches!(
+                applied,
+                Applied::Down { instrument, reason: DownReason::Sync(_) } if instrument == id
+            ) {
+                self.count_abandoned();
+            }
+            self.verification = None;
+        }
+        if let Applied::Down { instrument, .. } = applied
+            && let Some(state) = self.states.get_mut(index_of(instrument))
+        {
+            *state = SnapshotState::Idle;
+        }
+    }
+
+    fn count_abandoned(&mut self) {
+        let stats = self.books.stats_mut();
+        stats.verifications_abandoned = stats.verifications_abandoned.saturating_add(1);
+    }
+
+    /// Starts the next verification when due, and abandons one that has taken too long.
+    fn schedule_verification(&mut self) {
+        let Some(every) = self.config.verify_every else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some((_, started)) = self.verification {
+            if now.duration_since(started) < self.config.verify_timeout {
+                return;
+            }
+            self.books.cancel_verification();
+            self.verification = None;
+            self.count_abandoned();
+        }
+        if now < self.next_verification {
+            return;
+        }
+        let count = self.books.instruments().iter().len();
+        for step in 0..count {
+            let index = self
+                .verify_cursor
+                .wrapping_add(step)
+                .checked_rem(count)
+                .unwrap_or(0);
+            let id = id_of(index);
+            let Some(instrument) = self.books.instruments().get(id).copied() else {
+                continue;
+            };
+            if !self.books.start_verification(id) {
+                continue;
+            }
+            self.record(Kind::MD_VERIFY_START, None, &[&id.get().to_le_bytes()]);
+            let job = SnapshotJob {
+                instrument,
+                generation: self.generation,
+                purpose: Purpose::Verify,
+            };
+            if self.jobs.send(job).is_ok() {
+                self.verification = Some((id, now));
+                let stats = self.books.stats_mut();
+                stats.snapshots_requested = stats.snapshots_requested.saturating_add(1);
+            } else {
+                self.books.cancel_verification();
+            }
+            self.verify_cursor = index.wrapping_add(1);
+            break;
+        }
+        self.next_verification = later(every);
+    }
+
+    fn apply_verification_snapshot(&mut self, result: SnapshotResult) {
+        let Some((id, _)) = self.verification else {
+            return; // Abandoned; its snapshot is of no use.
+        };
+        if id != result.instrument || self.books.verifying() != Some(id) {
+            return;
+        }
+        let Ok(snapshot) = result.outcome else {
+            self.books.cancel_verification();
+            self.verification = None;
+            self.count_abandoned();
+            return;
+        };
+        self.record(
+            Kind::MD_VERIFY_SNAPSHOT,
+            Some(snapshot.fetched_at),
+            &[&id.get().to_le_bytes(), &snapshot.raw],
+        );
+        let verdict = self.books.on_verification_snapshot(
+            id,
+            snapshot.last_update_id,
+            &snapshot.bids,
+            &snapshot.asks,
+            &mut self.handler,
+        );
+        match verdict {
+            Verification::Pending => {}
+            Verification::Passed | Verification::NotRunning => self.verification = None,
+            Verification::Failed(_) => {
+                self.verification = None;
+                if let Some(state) = self.states.get_mut(index_of(id)) {
+                    *state = SnapshotState::Idle;
+                }
+            }
+            Verification::Unusable => {
+                self.verification = None;
+                self.count_abandoned();
+            }
+        }
+    }
+
+    /// Sends the handler a report when one is due.
+    fn maybe_report(&mut self) {
+        let elapsed = self.report_started.elapsed();
+        if elapsed < self.config.report_every {
+            return;
+        }
+        let report = MdReport {
+            interval: elapsed,
+            stats: self.books.stats(),
+            latency: self.interval_latency.summary(),
+        };
+        self.interval_latency.reset();
+        self.report_started = Instant::now();
+        self.handler.on_report(&report);
     }
 }
 
@@ -544,14 +749,25 @@ pub enum MdError {
     Spawn,
 }
 
+/// Why a snapshot was requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// To bring a book live.
+    Sync,
+    /// To verify a live book.
+    Verify,
+}
+
 struct SnapshotJob {
     instrument: Instrument,
     generation: u64,
+    purpose: Purpose,
 }
 
 struct SnapshotResult {
     instrument: InstrumentId,
     generation: u64,
+    purpose: Purpose,
     outcome: Result<OwnedSnapshot, SnapshotFailure>,
 }
 
@@ -613,6 +829,7 @@ impl SnapshotWorker {
             let result = SnapshotResult {
                 instrument: job.instrument.id,
                 generation: job.generation,
+                purpose: job.purpose,
                 outcome,
             };
             if results.send(result).is_err() {

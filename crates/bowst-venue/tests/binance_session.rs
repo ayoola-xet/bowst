@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use bowst_book::Book;
 use bowst_core::{Dec, Instrument, InstrumentId, InstrumentTable, Side, Symbol, VenueId, WallTime};
 use bowst_venue::binance::exchange_info::decode_exchange_info;
-use bowst_venue::binance::md::{MdConfig, MdHandler, MdSession, MdStatus};
+use bowst_venue::binance::md::{MdConfig, MdHandler, MdReport, MdSession, MdStatus};
 use bowst_venue::json::Reader;
 use bowst_venue::net::TlsConfig;
 use bowst_venue::ws::handshake::accept_for_key;
@@ -183,6 +183,9 @@ struct Faults {
     disconnect_after: Option<usize>,
     /// Go silent (no data, no pings) after this frame index, on the first connection only.
     silence_after: Option<usize>,
+    /// Once every frame is sent, silently remove BTCUSDT's tenth-best bid from the true book,
+    /// with no message: a divergence that no sequence check can see.
+    hidden_removal: bool,
 }
 
 struct Venue {
@@ -192,6 +195,7 @@ struct Venue {
     connections: AtomicUsize,
     snapshots_served: AtomicUsize,
     faults: Faults,
+    hidden_done: AtomicBool,
     shutdown: AtomicBool,
 }
 
@@ -208,6 +212,7 @@ impl Venue {
             connections: AtomicUsize::new(0),
             snapshots_served: AtomicUsize::new(0),
             faults,
+            hidden_done: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         });
         let ws = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -280,6 +285,13 @@ impl Venue {
             }
             let index = self.cursor.load(Ordering::SeqCst);
             let Some(frame) = self.frames.get(index) else {
+                if self.faults.hidden_removal && !self.hidden_done.load(Ordering::SeqCst) {
+                    let mut books = self.books.lock().unwrap();
+                    let bids = &mut books.get_mut("BTCUSDT").unwrap().bids;
+                    let tenth = *bids.keys().rev().nth(9).unwrap();
+                    bids.remove(&tenth);
+                    self.hidden_done.store(true, Ordering::SeqCst);
+                }
                 // Caught up: keep the connection alive like Binance does, with pings.
                 if stream.write_all(&server_frame(0x9, b"keepalive")).is_err() {
                     return;
@@ -381,6 +393,7 @@ struct Observed {
     books: BTreeMap<u32, BestLevels>,
     /// Every book update and instrument status change, in order, for replay comparison.
     events: Vec<String>,
+    reports: Vec<MdReport>,
 }
 
 struct Recorder {
@@ -425,6 +438,10 @@ impl MdHandler for Recorder {
             observed.events.push(format!("{status:?}"));
         }
         observed.statuses.push(status);
+    }
+
+    fn on_report(&mut self, report: &MdReport) {
+        self.observed.lock().unwrap().reports.push(*report);
     }
 }
 
@@ -527,6 +544,29 @@ impl Run {
                         && *asks == self.venue.true_best(symbol, Side::Sell)
                 })
         })
+    }
+
+    /// Waits until the latest report satisfies `done`.
+    fn wait_for_report(&self, done: impl Fn(&MdReport) -> bool) {
+        let started = Instant::now();
+        loop {
+            if self
+                .observed
+                .lock()
+                .unwrap()
+                .reports
+                .last()
+                .is_some_and(&done)
+            {
+                return;
+            }
+            assert!(
+                started.elapsed() < DEADLINE,
+                "report condition not met; statuses: {:?}",
+                self.statuses()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn statuses(&self) -> Vec<MdStatus> {
@@ -741,24 +781,102 @@ fn journal_replays_the_live_session_exactly() {
     let journal_stats = journal.finish().unwrap();
     assert_eq!(journal_stats.dropped, 0);
 
+    let report = assert_replay_matches(&dir, &live);
+    assert_eq!(report.sessions, 1);
+    assert_eq!(report.dropped, 0);
+    assert!(!report.torn_tail);
+    assert!(report.resets >= 2, "disconnect and final stop: {report:?}");
+    assert!(live.lock().unwrap().events.len() > 300);
+}
+
+/// Replays the journal in `dir` and checks it reproduces every book update and instrument
+/// status change the live session reported, in order. Removes the journal.
+fn assert_replay_matches(
+    dir: &std::path::Path,
+    live: &Mutex<Observed>,
+) -> bowst_venue::binance::replay::ReplayReport {
     let replayed = Arc::new(Mutex::new(Observed::default()));
     let mut recorder = Recorder {
         observed: Arc::clone(&replayed),
         instruments: instruments(),
     };
-    let mut reader = bowst_journal::JournalReader::open(&dir).unwrap();
+    let mut reader = bowst_journal::JournalReader::open(dir).unwrap();
     let report = bowst_venue::binance::replay::replay(&mut reader, &mut recorder).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert_eq!(report.sessions, 1);
-    assert_eq!(report.dropped, 0);
-    assert!(!report.torn_tail);
-    assert!(report.resets >= 2, "disconnect and final stop: {report:?}");
+    let _ = std::fs::remove_dir_all(dir);
     let (live, replayed) = (live.lock().unwrap(), replayed.lock().unwrap());
-    assert!(live.events.len() > 300, "{}", live.events.len());
     assert_eq!(live.events.len(), replayed.events.len());
     for (i, (a, b)) in live.events.iter().zip(&replayed.events).enumerate() {
         assert_eq!(a, b, "first difference at event {i}");
     }
     assert_eq!(live.books, replayed.books);
+    report
+}
+
+#[test]
+fn verification_confirms_a_clean_session() {
+    let run = start(Faults::default(), |config| {
+        config.verify_every = Some(Duration::from_millis(20));
+        config.report_every = Duration::from_millis(50);
+    });
+    run.converge();
+    // Both instruments verified at least twice, all passing.
+    run.wait_for_report(|r| r.stats.verifications_passed >= 4);
+    let reports = run.observed.lock().unwrap().reports.clone();
+    let (statuses, stats, _) = run.finish();
+    assert_eq!(stats.verification_mismatches, 0, "{statuses:?}");
+    assert_eq!(
+        count(&statuses, |s| matches!(s, MdStatus::InstrumentDown { .. })),
+        0,
+        "{statuses:?}"
+    );
+    let measured: u64 = reports.iter().map(|r| r.latency.count).sum();
+    assert!(measured > 0, "decode-and-apply latency recorded");
+    assert!(
+        reports
+            .iter()
+            .filter(|r| r.latency.count > 0)
+            .all(|r| r.latency.min <= r.latency.p50
+                && r.latency.p50 <= r.latency.p99
+                && r.latency.p99 <= r.latency.max)
+    );
+}
+
+#[test]
+fn verification_catches_a_divergence_no_sequence_check_can_see() {
+    let dir = std::env::temp_dir().join(format!("bowst-md-verify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (producer, journal) =
+        bowst_journal::start(bowst_journal::JournalConfig::new(&dir)).unwrap();
+    let run = start_journaled(
+        Faults {
+            hidden_removal: true,
+            ..Faults::default()
+        },
+        |config| config.verify_every = Some(Duration::from_millis(20)),
+        Some(producer),
+    );
+    let started = Instant::now();
+    while !run.venue.hidden_done.load(Ordering::SeqCst) {
+        assert!(started.elapsed() < DEADLINE);
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Converging now requires verification to notice the divergence and resync the book.
+    run.converge();
+    let live = Arc::clone(&run.observed);
+    let (statuses, stats, _) = run.finish();
+    assert_eq!(stats.verification_mismatches, 1, "{statuses:?}");
+    assert!(
+        statuses.iter().any(
+            |s| matches!(s, MdStatus::InstrumentDown { instrument, reason }
+            if instrument.get() == 0 && reason.contains("differs from a fresh snapshot"))
+        ),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        stats.connections, 1,
+        "a mismatch must not drop the connection"
+    );
+    journal.finish().unwrap();
+    let report = assert_replay_matches(&dir, &live);
+    assert!(report.verifications >= 1, "{report:?}");
 }

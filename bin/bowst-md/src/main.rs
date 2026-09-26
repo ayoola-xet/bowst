@@ -12,14 +12,18 @@
 //! exact replay. `--replay DIR` replays a recorded journal through the same book logic and
 //! prints the final books and a report.
 //!
+//! Every 10 seconds it prints a `[stats]` line: messages, decode-and-apply latency percentiles,
+//! and the results of verifying books against fresh snapshots (one instrument per minute).
+//!
 //! Defaults point at Binance's public market-data endpoints (`data-stream.binance.vision`,
 //! `data-api.binance.vision`), which serve public data only. The exit code is non-zero if any
-//! instrument never went live.
+//! instrument never went live, or if any book failed verification.
 
 // Operator CLI: printing to the terminal is its purpose.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,8 +31,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bowst_book::Book;
-use bowst_core::{InstrumentId, InstrumentTable, Price, Qty, Symbol, WallTime};
-use bowst_venue::binance::md::{MdConfig, MdHandler, MdSession, MdStatus};
+use bowst_core::{Instrument, InstrumentId, InstrumentTable, Price, Qty, Symbol, WallTime};
+use bowst_journal::JournalReader;
+use bowst_journal::format::Kind;
+use bowst_telemetry::LatencySummary;
+use bowst_venue::binance::md::{MdConfig, MdHandler, MdReport, MdSession, MdStats, MdStatus};
+use bowst_venue::binance::replay::parse_description;
 use bowst_venue::binance::rest::load_instruments;
 use bowst_venue::net::TlsConfig;
 
@@ -40,8 +48,8 @@ struct Args {
     seconds: u64,
     stream: String,
     rest: String,
-    journal: Option<std::path::PathBuf>,
-    replay: Option<std::path::PathBuf>,
+    journal: Option<PathBuf>,
+    replay: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -106,6 +114,8 @@ struct Top {
 struct Recorder {
     board: Arc<Mutex<Board>>,
     symbols: Vec<Symbol>,
+    /// Messages counted at the previous report.
+    reported_messages: u64,
 }
 
 impl MdHandler for Recorder {
@@ -155,6 +165,48 @@ impl MdHandler for Recorder {
             MdStatus::Connected => println!("[status] connected"),
         }
     }
+
+    fn on_report(&mut self, report: &MdReport) {
+        let messages = report.stats.messages.saturating_sub(self.reported_messages);
+        self.reported_messages = report.stats.messages;
+        println!(
+            "[stats] {}s: {messages} msgs, decode+apply {}; verified {} ok, {} mismatched, {} abandoned",
+            report.interval.as_secs(),
+            latency_text(&report.latency),
+            report.stats.verifications_passed,
+            report.stats.verification_mismatches,
+            report.stats.verifications_abandoned,
+        );
+    }
+}
+
+/// One board line: best bid and ask in decimal units, spread, depth and the given rate text.
+fn board_line(instrument: &Instrument, top: &Top, live: bool, rate: &str) -> String {
+    let side = |level: Option<(Price, Qty)>| {
+        level.map_or_else(
+            || "-".to_owned(),
+            |(p, q)| {
+                format!(
+                    "{} @ {}",
+                    q.to_dec(instrument.lot),
+                    p.to_dec(instrument.tick)
+                )
+            },
+        )
+    };
+    let spread = match (top.bid, top.ask) {
+        (Some((bid, _)), Some((ask, _))) => ask.checked_sub(bid).map_or(0, Price::get),
+        _ => 0,
+    };
+    format!(
+        "{:<10} {:<5} bid {:<28} ask {:<28} spread {spread:>4} ticks  depth {}/{}  {rate}",
+        instrument.symbol.as_str(),
+        if live { "LIVE" } else { "down" },
+        side(top.bid),
+        side(top.ask),
+        top.depth.0,
+        top.depth.1,
+    )
 }
 
 fn print_board(board: &Board, instruments: &InstrumentTable, previous: &mut BTreeMap<u32, u64>) {
@@ -165,37 +217,57 @@ fn print_board(board: &Board, instruments: &InstrumentTable, previous: &mut BTre
             .updates
             .saturating_sub(previous.insert(id, top.updates).unwrap_or(0));
         let live = board.live.get(&id).copied().unwrap_or(false);
-        let side = |level: Option<(Price, Qty)>| {
-            level.map_or_else(
-                || "-".to_owned(),
-                |(p, q)| {
-                    format!(
-                        "{} @ {}",
-                        q.to_dec(instrument.lot),
-                        p.to_dec(instrument.tick)
-                    )
-                },
-            )
-        };
-        let spread = match (top.bid, top.ask) {
-            (Some((bid, _)), Some((ask, _))) => ask.checked_sub(bid).map_or(0, Price::get),
-            _ => 0,
-        };
         println!(
-            "{:<10} {:<5} bid {:<28} ask {:<28} spread {spread:>4} ticks  depth {}/{}  {rate:>3} upd/s",
-            instrument.symbol.as_str(),
-            if live { "LIVE" } else { "down" },
-            side(top.bid),
-            side(top.ask),
-            top.depth.0,
-            top.depth.1,
+            "{}",
+            board_line(instrument, &top, live, &format!("{rate:>3} upd/s"))
         );
     }
 }
 
+/// The instruments of the journal's sessions, from their session-start records. `None` if the
+/// journal holds no session. Every session must describe the same instruments, so one set of
+/// labels is right for the whole replay.
+fn journal_instruments(dir: &Path) -> Result<Option<InstrumentTable>, String> {
+    let mut reader = JournalReader::open(dir).map_err(|e| e.to_string())?;
+    let mut found: Option<InstrumentTable> = None;
+    while let Some(record) = reader.next_record().map_err(|e| e.to_string())? {
+        if record.header.kind != Kind::SESSION_START {
+            continue;
+        }
+        let text = String::from_utf8_lossy(record.payload);
+        let (_, table) = parse_description(&text).map_err(|e| e.to_string())?;
+        match &found {
+            Some(first) if !same_instruments(first, &table) => {
+                return Err(
+                    "its sessions describe different instruments; replay each run's journal separately"
+                        .into(),
+                );
+            }
+            Some(_) => {}
+            None => found = Some(table),
+        }
+    }
+    Ok(found)
+}
+
+fn same_instruments(a: &InstrumentTable, b: &InstrumentTable) -> bool {
+    a.iter().len() == b.iter().len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
 /// Replays a journal and prints the final books.
-fn replay_journal(dir: &std::path::Path) -> ExitCode {
-    let mut reader = match bowst_journal::JournalReader::open(dir) {
+fn replay_journal(dir: &Path) -> ExitCode {
+    let instruments = match journal_instruments(dir) {
+        Ok(Some(instruments)) => instruments,
+        Ok(None) => {
+            eprintln!("the journal holds no session");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("cannot replay journal: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut reader = match JournalReader::open(dir) {
         Ok(reader) => reader,
         Err(e) => {
             eprintln!("cannot open journal: {e}");
@@ -203,10 +275,10 @@ fn replay_journal(dir: &std::path::Path) -> ExitCode {
         }
     };
     let board = Arc::new(Mutex::new(Board::default()));
-    // The journal names its instruments; symbols here only label status lines.
     let mut recorder = Recorder {
         board: Arc::clone(&board),
-        symbols: Vec::new(),
+        symbols: instruments.iter().map(|i| i.symbol).collect(),
+        reported_messages: 0,
     };
     let report = match bowst_venue::binance::replay::replay(&mut reader, &mut recorder) {
         Ok(report) => report,
@@ -216,10 +288,11 @@ fn replay_journal(dir: &std::path::Path) -> ExitCode {
         }
     };
     println!(
-        "replayed {} session(s): {} messages, {} snapshots, {} resets, {} records missing{}",
+        "replayed {} session(s): {} messages, {} snapshots, {} verification snapshots, {} resets, {} records missing{}",
         report.sessions,
         report.messages,
         report.snapshots,
+        report.verifications,
         report.resets,
         report.dropped,
         if report.torn_tail {
@@ -229,14 +302,13 @@ fn replay_journal(dir: &std::path::Path) -> ExitCode {
         }
     );
     if let Ok(board) = board.lock() {
-        for (id, top) in &board.tops {
+        for instrument in instruments.iter() {
+            let id = instrument.id.get();
+            let top = board.tops.get(&id).copied().unwrap_or_default();
+            let live = board.live.get(&id).copied().unwrap_or(false);
             println!(
-                "instrument #{id}: bid {:?} ask {:?} depth {}/{} after {} updates",
-                top.bid.map(|(p, q)| (p.get(), q.get())),
-                top.ask.map(|(p, q)| (p.get(), q.get())),
-                top.depth.0,
-                top.depth.1,
-                top.updates
+                "{}",
+                board_line(instrument, &top, live, &format!("{} updates", top.updates))
             );
         }
     }
@@ -269,6 +341,45 @@ fn watch(
         }
     }
     ever_live
+}
+
+/// Nanoseconds as microseconds with two decimals, without floating point.
+fn micros(nanos: u64) -> String {
+    format!("{}.{:02} µs", nanos / 1_000, nanos % 1_000 / 10)
+}
+
+fn latency_text(latency: &LatencySummary) -> String {
+    if latency.count == 0 {
+        return "no samples".into();
+    }
+    format!(
+        "p50 {} p99 {} p99.9 {} max {}",
+        micros(latency.p50),
+        micros(latency.p99),
+        micros(latency.p999),
+        micros(latency.max)
+    )
+}
+
+fn print_summary(stats: &MdStats, latency: &LatencySummary) {
+    println!(
+        "summary: {} messages, {} deltas applied, {} book invalidations, {} connections, {}/{} snapshots applied/requested",
+        stats.messages,
+        stats.deltas_applied,
+        stats.book_invalidations,
+        stats.connections,
+        stats.snapshots_applied,
+        stats.snapshots_requested
+    );
+    println!(
+        "latency: decode+apply over {} messages: {}",
+        latency.count,
+        latency_text(latency)
+    );
+    println!(
+        "verification: {} passed, {} mismatched, {} abandoned",
+        stats.verifications_passed, stats.verification_mismatches, stats.verifications_abandoned
+    );
 }
 
 /// Flushes and closes the journal, printing its statistics. `false` if it failed.
@@ -326,6 +437,7 @@ fn main() -> ExitCode {
     let recorder = Recorder {
         board: Arc::clone(&board),
         symbols: args.symbols.clone(),
+        reported_messages: 0,
     };
     let mut config = MdConfig::new(&args.stream, &args.rest);
     // A shared machine: sleep briefly when idle instead of spinning a core.
@@ -355,7 +467,7 @@ fn main() -> ExitCode {
     let flag = Arc::clone(&stop);
     let md = thread::Builder::new().name("md".into()).spawn(move || {
         session.run(&flag);
-        session.stats()
+        (session.stats(), session.latency())
     });
     let Ok(md) = md else {
         eprintln!("could not start the market-data thread");
@@ -364,7 +476,7 @@ fn main() -> ExitCode {
 
     let ever_live = watch(&board, &instruments, Duration::from_secs(args.seconds));
     stop.store(true, Ordering::Relaxed);
-    let Ok(stats) = md.join() else {
+    let Ok((stats, latency)) = md.join() else {
         eprintln!("market-data thread panicked");
         return ExitCode::FAILURE;
     };
@@ -373,19 +485,150 @@ fn main() -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    println!(
-        "summary: {} messages, {} deltas applied, {} book invalidations, {} connections, {}/{} snapshots applied/requested",
-        stats.messages,
-        stats.deltas_applied,
-        stats.book_invalidations,
-        stats.connections,
-        stats.snapshots_applied,
-        stats.snapshots_requested
-    );
+    print_summary(&stats, &latency);
+    if stats.verification_mismatches > 0 {
+        eprintln!(
+            "a book differed from a fresh venue snapshot: investigate before trusting this build"
+        );
+        return ExitCode::FAILURE;
+    }
     if ever_live.len() == instruments.iter().len() {
         ExitCode::SUCCESS
     } else {
         eprintln!("some instruments never went live");
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use bowst_book::SyncConfig;
+    use bowst_core::{Dec, Increment, MonoTime, VenueId};
+    use bowst_journal::format::RecordHeader;
+    use bowst_venue::binance::replay::{BookSizing, describe};
+
+    fn instrument(id: u32, symbol: &str) -> Instrument {
+        Instrument {
+            id: InstrumentId::new(id),
+            venue: VenueId::Binance,
+            symbol: Symbol::new(symbol).unwrap(),
+            tick: Increment::parse("0.01").unwrap(),
+            lot: Increment::parse("0.00001").unwrap(),
+            min_notional: Dec::parse("5").unwrap(),
+        }
+    }
+
+    fn table(symbols: &[&str]) -> InstrumentTable {
+        InstrumentTable::new(
+            symbols
+                .iter()
+                .enumerate()
+                .map(|(i, s)| instrument(u32::try_from(i).unwrap(), s))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// Writes one session-start record per table into a fresh journal directory.
+    fn journal(name: &str, sessions: &[InstrumentTable]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bowst-md-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sizing = BookSizing {
+            sync: SyncConfig {
+                levels_per_side: 10,
+                buffered_messages: 10,
+                buffered_updates: 10,
+            },
+            max_levels_per_message: 10,
+            snapshot_limit: 10,
+        };
+        for session in sessions {
+            let (mut producer, handle) =
+                bowst_journal::start(bowst_journal::JournalConfig::new(&dir)).unwrap();
+            let header = RecordHeader {
+                kind: Kind::SESSION_START,
+                source: 1,
+                mono: MonoTime::from_nanos(1),
+                wall: WallTime::from_nanos(1),
+            };
+            assert!(producer.append(header, &[describe(&sizing, session).as_bytes()]));
+            drop(producer);
+            handle.finish().unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn board_line_shows_decimal_prices_and_quantities() {
+        let top = Top {
+            bid: Some((Price::new(8_475_800), Qty::new(438_837))),
+            ask: Some((Price::new(8_475_801), Qty::new(13_276))),
+            depth: (1_185, 943),
+            updates: 159,
+            event_time: WallTime::from_nanos(0),
+        };
+        let line = board_line(&instrument(0, "BTCUSDT"), &top, true, "159 updates");
+        assert!(
+            line.starts_with("BTCUSDT    LIVE  bid 4.38837 @ 84758.00"),
+            "{line}"
+        );
+        assert!(line.contains("ask 0.13276 @ 84758.01"), "{line}");
+        assert!(
+            line.contains("spread    1 ticks  depth 1185/943  159 updates"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn latency_is_shown_in_microseconds_without_floats() {
+        assert_eq!(micros(0), "0.00 µs");
+        assert_eq!(micros(1_234), "1.23 µs");
+        assert_eq!(micros(12_005), "12.00 µs");
+        assert_eq!(latency_text(&LatencySummary::default()), "no samples");
+        let summary = LatencySummary {
+            count: 3,
+            min: 900,
+            p50: 1_000,
+            p90: 2_000,
+            p99: 4_990,
+            p999: 5_000,
+            max: 70_000,
+        };
+        assert_eq!(
+            latency_text(&summary),
+            "p50 1.00 µs p99 4.99 µs p99.9 5.00 µs max 70.00 µs"
+        );
+    }
+
+    #[test]
+    fn replay_labels_come_from_the_journal() {
+        let dir = journal(
+            "labels",
+            &[
+                table(&["BTCUSDT", "ETHUSDT"]),
+                table(&["BTCUSDT", "ETHUSDT"]),
+            ],
+        );
+        let found = journal_instruments(&dir).unwrap().unwrap();
+        let symbols: Vec<_> = found.iter().map(|i| i.symbol.as_str().to_owned()).collect();
+        assert_eq!(symbols, ["BTCUSDT", "ETHUSDT"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journal_mixing_instrument_sets_is_rejected() {
+        let dir = journal("mixed", &[table(&["BTCUSDT"]), table(&["SOLUSDT"])]);
+        assert!(journal_instruments(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_journal_has_no_instruments() {
+        let dir = journal("empty", &[]);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(journal_instruments(&dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
