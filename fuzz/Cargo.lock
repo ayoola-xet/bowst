@@ -50,11 +50,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowst-telemetry"
+version = "0.1.0"
+
+[[package]]
 name = "bowst-venue"
 version = "0.1.0"
 dependencies = [
  "bowst-book",
  "bowst-core",
+ "bowst-journal",
+ "bowst-telemetry",
  "rustls",
  "rustls-native-certs",
  "sha1_smol",

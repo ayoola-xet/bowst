@@ -70,6 +70,34 @@ fn book_updates(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("book/update_level_at_depth_50", |b| {
+        let mut qty = 1;
+        b.iter(|| {
+            qty = qty % 50 + 1;
+            book.apply(black_box(LevelUpdate {
+                side: Side::Sell,
+                price: Price::new(MID + 50),
+                qty: Qty::new(qty),
+            }))
+        });
+    });
+
+    c.bench_function("book/insert_and_remove_at_depth_200", |b| {
+        b.iter(|| {
+            // Removing a level 200 deep, then adding it back: the deep churn that dominates
+            // recorded Binance traffic.
+            let price = Price::new(MID + 200);
+            for qty in [Qty::ZERO, Qty::new(10)] {
+                book.apply(black_box(LevelUpdate {
+                    side: Side::Sell,
+                    price,
+                    qty,
+                }))
+                .unwrap();
+            }
+        });
+    });
+
     c.bench_function("book/best_bid_ask", |b| {
         b.iter(|| (black_box(&book).best_bid(), black_box(&book).best_ask()));
     });

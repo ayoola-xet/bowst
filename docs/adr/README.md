@@ -14,6 +14,7 @@ Each significant architecture decision gets one short record here, numbered in o
 | [0008](0008-market-data-session.md) | Market-data session: one stream, a separate snapshot thread, fail closed per instrument | Accepted |
 | [0009](0009-event-journal.md) | Event journal: hot-path byte ring, background writer, checksummed segments | Accepted |
 | [0010](0010-book-verification-and-telemetry.md) | Book verification against fresh snapshots; decode-and-apply latency histograms | Accepted |
+| [0011](0011-market-data-latency-target.md) | Market-data latency target restated per changed level and per message | Accepted |
 
 ## Template
 

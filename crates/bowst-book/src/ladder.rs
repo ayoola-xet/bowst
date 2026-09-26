@@ -432,4 +432,24 @@ mod tests {
         ));
         assert!(small.is_empty());
     }
+
+    proptest::proptest! {
+        /// The search agrees with a plain binary search over the whole ladder, on both sides,
+        /// for prices held, between levels, and beyond either end.
+        #[test]
+        fn search_matches_a_reference_binary_search(
+            prices in proptest::collection::btree_set(1_i64..10_000, 0..300),
+            probe in 0_i64..10_100,
+            buy in proptest::bool::ANY,
+        ) {
+            let side = if buy { Side::Buy } else { Side::Sell };
+            let mut ladder = Ladder::new(side, 1_000).unwrap();
+            ladder.load(prices.iter().map(|&p| lvl(p, 1))).unwrap();
+            let probe = Price::new(probe);
+            let reference = ladder
+                .levels
+                .binary_search_by(|level| ladder.rank(level.price, probe));
+            proptest::prop_assert_eq!(ladder.search(probe), reference);
+        }
+    }
 }

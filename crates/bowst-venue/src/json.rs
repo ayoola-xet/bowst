@@ -226,6 +226,26 @@ impl<'a> Reader<'a> {
         Ok(text)
     }
 
+    /// Reads a string without escape sequences as raw bytes, borrowed from the input and not
+    /// checked for UTF-8. For values the caller parses strictly (numbers), where any
+    /// non-ASCII byte is rejected anyway, this saves a validation pass.
+    ///
+    /// # Errors
+    /// If the next value is not a string, or contains an escape or control character.
+    #[inline]
+    pub fn str_bytes(&mut self) -> Result<&'a [u8], JsonError> {
+        self.expect_byte(b'"', "string")?;
+        let start = self.pos;
+        let end = self.string_end()?;
+        if self.buf.get(end) == Some(&b'\\') {
+            return Err(JsonError::EscapedString { pos: end });
+        }
+        let bytes = self.buf.get(start..end).ok_or(JsonError::UnexpectedEnd)?;
+        self.pos = end.saturating_add(1);
+        self.after_value = true;
+        Ok(bytes)
+    }
+
     /// Offset of the first `"` or `\\` at or after the current position, rejecting control
     /// characters. One tight scan instead of a bounds-checked step per byte.
     fn string_end(&mut self) -> Result<usize, JsonError> {
