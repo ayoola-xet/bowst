@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009), and continuous book verification against fresh snapshots plus decode-and-apply latency histograms (`crates/bowst-telemetry`, ADR 0010). Remaining for Phase 1: Prometheus export, the decision on the latency target (see §15), and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
+**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009), and continuous book verification against fresh snapshots plus decode-and-apply latency histograms (`crates/bowst-telemetry`, ADR 0010). Remaining for Phase 1: Prometheus export and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -386,7 +386,7 @@ Each phase has exit criteria. A phase is not done until its criteria are met and
 | Phase | Scope | Exit criteria | Est. |
 |---|---|---|---|
 | **0. Foundations** | Workspace, CI, core types (fixed-point, IDs, events), SPSC ring, clock, allocation-counting allocator, ADRs. | CI green with lint, test, Miri, supply-chain and bench-build jobs. Ring handoff within noise of the host's bare atomic-signal floor. | 1–2 wk |
-| **1. Market data** | Shared venue plumbing (§9.1) and the Binance Spot adapter (market data only), book builder with gap and resync handling, journal, telemetry. | 72 h continuous run with zero undetected gaps. Book matches venue snapshots. Decode + book update < 5 µs p99. | 2–3 wk |
+| **1. Market data** | Shared venue plumbing (§9.1) and the Binance Spot adapter (market data only), book builder with gap and resync handling, journal, telemetry. | 72 h continuous run with zero undetected gaps. Book matches venue snapshots. Decode + book update on recorded traffic: ≤ 175 ns per changed level on average, p50 ≤ 2 µs and p99 ≤ 25 µs per message (ADR 0011). | 2–3 wk |
 | **2. Order entry + OMS** | Binance Spot order entry, OMS state machine, reconciliation, safe startup and shutdown, cancel-on-disconnect. | Conformance suite passes on testnet. Chaos tests leave zero orphaned orders. | 3–4 wk |
 | **3. Risk + control plane** | Full pre-trade gate, monitors, kill switch, watchdog process, `bowstctl`, limit config signing. | Every risk rule has a test proving it blocks. Kill-to-all-cancelled < 1 s verified on testnet. | 2–3 wk |
 | **4. Strategy + simulator** | Baseline quoting (§6), `bowst-sim`, backtest harness, markout analytics. | Positive expected net PnL after fees in the backtest over multiple regimes, with sane inventory. End-to-end tick-to-order < 20 µs p50. | 3–4 wk |
@@ -396,7 +396,7 @@ Each phase has exit criteria. A phase is not done until its criteria are met and
 | **7b. Similar venues** | Further spot exchanges (for example OKX), one at a time. | Same as Phase 7. | ongoing |
 | **8. Performance hardening** | Kernel bypass, binary protocols, profile-guided optimization, where measurements justify it. | Measured improvement in live fill quality, not just benchmarks. | ongoing |
 
-**Open: the Phase 1 latency target.** Measured on recorded Binance traffic (ADR 0010), decode plus book update costs about 175 ns per changed level. Binance batches 100 ms of changes per message, about 140 levels at p99, so the p99 per message is about 25 µs, not 5 µs. Meeting the target as written needs roughly a fivefold cut in per-level cost. The options are to optimize (decoding and deep-level book updates are the two halves), to restate the target per level or as time to a correct top of book, or both. This needs a decision before Phase 1 closes.
+**Phase 1 latency target** (ADR 0011). The original target of 5 µs p99 per message assumed small messages. Binance batches 100 ms of changes per message (about 140 levels at p99), so the target is now stated per changed level and per message size. After optimization, the recorded-traffic benchmark measures about 155 ns per level, 1.3 µs p50 and 18–20 µs p99 per message.
 
 The earliest realistic date for **meaningful live capital is about 4–5 months** from the start of Phase 0. Skipping the validation phases is how market makers lose money quickly.
 
