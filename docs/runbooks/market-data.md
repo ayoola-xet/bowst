@@ -67,3 +67,35 @@ Latency depends on message size: Binance batches 100 ms of changes into each mes
 ## Configuration reference
 
 Defaults are set in `MdConfig::new`: 1,000-level snapshots, `stale_after` 60 s, `max_connection_age` 23 h, backoff from 250 ms to 30 s, 1,200 REST weight per minute (Binance allows 6,000 per IP), verification every 60 s (abandoned after 30 s without a verdict), and a report every 10 s.
+
+## Alerts
+
+Prometheus alert rules are in `docs/deploy/prometheus/bowst-alerts.yml`; setup is in `docs/deploy/monitoring.md`. Each alert below links here.
+
+### Alert: BowstMdScrapeFailing
+**Critical.** Prometheus cannot reach the metrics endpoint: the process exited, hung, or was started without `--metrics`. Check `systemctl status` or the terminal, and the end of the log for a panic or exit message. If the process is running but the endpoint does not answer, capture a stack dump before restarting.
+
+### Alert: BowstMdStalled
+**Critical.** The session has not reported for over a minute although the endpoint answers: the market-data thread is stuck. Books cannot be trusted. Capture the log and a stack dump, then restart. Treat it as a bug and escalate.
+
+### Alert: BowstMdDisconnected
+**Critical.** The WebSocket has been down for over 2 minutes. See `Disconnected` above: check the venue status page, DNS and outbound connectivity.
+
+### Alert: BowstMdInstrumentDown
+**Critical.** One book has been down for over 2 minutes while connected: resynchronization keeps failing. See `InstrumentDown` and `SnapshotFailed` above; check for 429 or 418 responses and whether the symbol is in maintenance.
+
+### Alert: BowstMdVerificationMismatch
+**Critical.** A live book differed from a fresh snapshot. See "Verification mismatch" above: keep the journal and escalate, even if the book recovered.
+
+### Alert: BowstMdBooksFlapping
+**Warning.** More than 5 book invalidations in 10 minutes. Usually network loss or venue trouble; check whether the reasons are gaps (network), crossed books or mismatches (escalate), and whether one symbol or all are affected.
+
+### Alert: BowstMdVerificationsNotRunning
+**Warning.** No verification has passed in 15 minutes while connected. Snapshots for verification are failing or being abandoned: check `SnapshotFailed` statuses and REST weight usage.
+
+### Alert: BowstMdLatencyHigh
+**Warning.** Decode-and-apply p99 has been above 25 µs (ADR 0011) for 10 minutes. On a laptop or shared VM this is expected. On production hardware, check that the market-data thread has an isolated core, that the host is not overloaded, and whether message sizes grew (a volatile market). Compare with the `md_books` benchmark on the same build.
+
+### Alert: BowstJournalNotOk
+**Critical.** The event journal dropped records or stopped persisting, so the audit trail is incomplete (ADR 0009). Check disk space and I/O errors in the log. Trading must not run without a healthy journal; `bowst-md` keeps streaming, but the soak run fails its acceptance criteria.
+

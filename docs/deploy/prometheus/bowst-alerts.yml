@@ -1,0 +1,85 @@
+# Alert rules for bowst market data. Load with `rule_files` in prometheus.yml
+# (see docs/deploy/monitoring.md). Every alert links to its runbook entry.
+#
+# severity: critical = needs a human now; warning = degraded but safe (CLAUDE.md §7).
+groups:
+  - name: bowst-market-data
+    rules:
+      - alert: BowstMdScrapeFailing
+        expr: up{job="bowst-md"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "bowst-md metrics endpoint unreachable (process down or blocked)"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdscrapefailing"
+
+      - alert: BowstMdStalled
+        expr: time() - bowst_md_last_report_timestamp_seconds > 60
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No market-data session report for over a minute: the market-data thread may be stuck"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdstalled"
+
+      - alert: BowstMdDisconnected
+        expr: bowst_md_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Market-data WebSocket disconnected for over 2 minutes"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmddisconnected"
+
+      - alert: BowstMdInstrumentDown
+        expr: bowst_md_instrument_live == 0 and on(venue) bowst_md_connected == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.symbol }} book down for over 2 minutes while connected"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdinstrumentdown"
+
+      - alert: BowstMdVerificationMismatch
+        expr: increase(bowst_md_verifications_total{result="mismatch"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A live book differed from a fresh venue snapshot"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdverificationmismatch"
+
+      - alert: BowstMdBooksFlapping
+        expr: increase(bowst_md_book_invalidations_total[10m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5 book invalidations in 10 minutes"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdbooksflapping"
+
+      - alert: BowstMdVerificationsNotRunning
+        expr: increase(bowst_md_verifications_total{result="passed"}[15m]) == 0 and on(venue) bowst_md_connected == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No book verification has passed in 15 minutes"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdverificationsnotrunning"
+
+      - alert: BowstMdLatencyHigh
+        expr: bowst_md_apply_latency_seconds{quantile="0.99"} > 0.000025
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Decode-and-apply p99 above the 25 µs target (ADR 0011) for 10 minutes"
+          runbook: "docs/runbooks/market-data.md#alert-bowstmdlatencyhigh"
+
+      - alert: BowstJournalNotOk
+        expr: bowst_journal_state{state="ok"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Event journal degraded or failed: the audit trail is incomplete"
+          runbook: "docs/runbooks/market-data.md#alert-bowstjournalnotok"

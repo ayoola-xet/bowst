@@ -41,7 +41,8 @@ Read README §17, item 6. Where the server sits does not decide whether the busi
   ```sh
   mkdir -p ~/bowst-soak
   caffeinate -i ./target/release/bowst-md --symbols BTCUSDT,ETHUSDT,SOLUSDT \
-    --seconds 259200 --journal ~/bowst-soak/journal > ~/bowst-soak/soak.log 2>&1
+    --seconds 259200 --journal ~/bowst-soak/journal --metrics 127.0.0.1:9184 \
+    > ~/bowst-soak/soak.log 2>&1
   ```
 
   Keep it plugged in with the lid open, and use a directory in your home folder: macOS clears `/tmp`. Do not rebuild or `git pull` in that checkout during the run. Replacing a running binary can get the process killed; use a second clone for development.
@@ -98,7 +99,7 @@ After=network-online.target time-sync.target
 User=bowst
 Group=bowst
 # 72 hours. Choose the pairs to test; each must exist on Binance Spot.
-ExecStart=/usr/local/bin/bowst-md --symbols BTCUSDT,ETHUSDT,SOLUSDT --seconds 259200 --journal /var/lib/bowst/journal
+ExecStart=/usr/local/bin/bowst-md --symbols BTCUSDT,ETHUSDT,SOLUSDT --seconds 259200 --journal /var/lib/bowst/journal --metrics 127.0.0.1:9184
 # A soak run must not be restarted automatically: a restart would hide the failure being tested for.
 Restart=no
 LimitNOFILE=65536
@@ -129,6 +130,8 @@ sudo systemctl start bowst-md-soak
 The tool prints one board line per instrument per second, which is about 1 GB of text over 72 hours with three pairs. Make sure journald keeps enough: set `SystemMaxUse=2G` in `/etc/systemd/journald.conf`, then run `sudo systemctl restart systemd-journald` before you start the run.
 
 ## 5. During the run
+
+With `--metrics`, Prometheus and Grafana can watch the run and alert on it; see `monitoring.md`. The commands below work without them.
 
 ```sh
 systemctl status bowst-md-soak                       # still running?

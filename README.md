@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009), and continuous book verification against fresh snapshots plus decode-and-apply latency histograms (`crates/bowst-telemetry`, ADR 0010). Remaining for Phase 1: Prometheus export and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
+**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009), and continuous book verification against fresh snapshots plus decode-and-apply latency histograms (`crates/bowst-telemetry`, ADR 0010). Prometheus metrics export with alert rules is in (`bowst-md --metrics`, ADR 0012; [monitoring guide](docs/deploy/monitoring.md)). Remaining for Phase 1: the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -145,7 +145,7 @@ These are enforced in code review and by tests (§10.5).
 | `bowst-journal` | Append-only binary event log: checksummed, rotated segment files written by a background thread from a lock-free byte ring (ADR 0009). Every inbound and outbound event is recorded. | Drives deterministic replay and post-mortems. Never silently incomplete: drops are marked and the journal's health gates trading. |
 | `bowst-sim` | Exchange simulator: matching engine with queue position, latency injection and venue-specific quirks. | Used for backtests, integration tests and chaos tests. |
 | `bowst-control` | Authenticated control API (gRPC or HTTPS with mTLS) plus the `bowstctl` CLI. | Kill switch, pause/resume per instrument, parameter updates, status. |
-| `bowst-telemetry` | Latency histograms (log-linear, allocation-free recording, integer percentiles) today; metrics (Prometheus) and structured logs next. | Only recording touches the hot path; summaries and export are off it. |
+| `bowst-telemetry` | Latency histograms (log-linear, allocation-free recording, integer percentiles), Prometheus text exposition and a loopback-only metrics endpoint (ADR 0012); structured logs next. | Only recording touches the hot path; summaries and export are off it. |
 | `bowst` (bin) | Wires everything together from config. Handles startup and shutdown sequencing. | |
 
 ---
@@ -318,7 +318,7 @@ CI (GitHub Actions) runs `fmt`, `clippy -D warnings`, tests, doc build, Miri on 
 
 ## 11. Observability and operations
 
-- **Metrics (Prometheus → Grafana):** tick-to-order latency histograms, venue round-trip, book age, quote uptime per instrument, fill rate, markouts, position, PnL (gross, fees, net), rate-limit headroom, reconnects, rejects by reason and risk-gate blocks by rule.
+- **Metrics (Prometheus → Grafana):** market data is exported today (`bowst-md --metrics`; see `docs/deploy/monitoring.md`). Planned for the engine: tick-to-order latency histograms, venue round-trip, book age, quote uptime per instrument, fill rate, markouts, position, PnL (gross, fees, net), rate-limit headroom, reconnects, rejects by reason and risk-gate blocks by rule.
 - **Alerts (PagerDuty/Telegram/Slack):** kill switch fired, reconciliation mismatch, drawdown threshold, venue disconnect beyond N seconds, latency SLO breach, quote uptime below target, and clock drift.
 - **Logs:** a binary hot-path log decoded off-thread into structured JSON, shipped to central storage.
 - **Runbooks** in `docs/runbooks/` for each alert: what it means, the first 5 minutes, and escalation.

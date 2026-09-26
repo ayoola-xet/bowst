@@ -24,6 +24,8 @@ const _: () = assert!(GROUPS == 64 - 5 + 1 && SUB_BITS == 5 && SUB_BUCKETS == 32
 pub struct LatencyHistogram {
     counts: Box<[u64; BUCKETS]>,
     count: u64,
+    /// Sum of every value (saturating), for means and Prometheus summaries.
+    sum: u64,
     max: u64,
     min: u64,
 }
@@ -33,6 +35,8 @@ pub struct LatencyHistogram {
 pub struct LatencySummary {
     /// Values recorded.
     pub count: u64,
+    /// Sum of every value (saturating).
+    pub sum: u64,
     /// Smallest value (exact).
     pub min: u64,
     /// Median.
@@ -60,6 +64,7 @@ impl LatencyHistogram {
         Self {
             counts: Box::new([0; BUCKETS]),
             count: 0,
+            sum: 0,
             max: 0,
             min: u64::MAX,
         }
@@ -72,6 +77,7 @@ impl LatencyHistogram {
             *slot = slot.saturating_add(1);
         }
         self.count = self.count.saturating_add(1);
+        self.sum = self.sum.saturating_add(nanos);
         self.max = self.max.max(nanos);
         self.min = self.min.min(nanos);
     }
@@ -119,6 +125,7 @@ impl LatencyHistogram {
     pub fn summary(&self) -> LatencySummary {
         LatencySummary {
             count: self.count,
+            sum: self.sum,
             min: self.min(),
             p50: self.value_at_ppm(500_000),
             p90: self.value_at_ppm(900_000),
@@ -134,6 +141,7 @@ impl LatencyHistogram {
             *mine = mine.saturating_add(*theirs);
         }
         self.count = self.count.saturating_add(other.count);
+        self.sum = self.sum.saturating_add(other.sum);
         self.max = self.max.max(other.max);
         self.min = self.min.min(other.min);
     }
@@ -142,6 +150,7 @@ impl LatencyHistogram {
     pub fn reset(&mut self) {
         self.counts.fill(0);
         self.count = 0;
+        self.sum = 0;
         self.max = 0;
         self.min = u64::MAX;
     }
@@ -237,6 +246,7 @@ mod tests {
         }
         let s = h.summary();
         assert_eq!((s.count, s.min, s.max), (1_000, 1, 1_000));
+        assert_eq!(s.sum, 500_500);
         // Exact rank values are 500, 900, 990 and 999; buckets overstate by at most ~3%.
         for (got, exact) in [(s.p50, 500), (s.p90, 900), (s.p99, 990), (s.p999, 999)] {
             assert!(
@@ -253,6 +263,7 @@ mod tests {
         b.record(1_000_000);
         a.merge(&b);
         assert_eq!((a.count(), a.min(), a.max()), (2, 10, 1_000_000));
+        assert_eq!(a.summary().sum, 1_000_010);
         a.reset();
         assert_eq!(a.summary(), LatencySummary::default());
     }

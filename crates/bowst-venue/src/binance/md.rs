@@ -181,6 +181,8 @@ pub struct MdReport {
     /// Time to decode one message and apply it to its book, over the interval, in
     /// nanoseconds. Excludes journaling and the handler.
     pub latency: LatencySummary,
+    /// The same, since the session started.
+    pub latency_total: LatencySummary,
 }
 
 /// Counters since the session started.
@@ -702,6 +704,7 @@ impl<H: MdHandler> MdSession<H> {
             interval: elapsed,
             stats: self.books.stats(),
             latency: self.interval_latency.summary(),
+            latency_total: self.total_latency.summary(),
         };
         self.interval_latency.reset();
         self.report_started = Instant::now();
