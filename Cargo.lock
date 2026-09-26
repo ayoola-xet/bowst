@@ -106,6 +106,7 @@ dependencies = [
  "bowst-core",
  "criterion",
  "proptest",
+ "thiserror",
 ]
 
 [[package]]
