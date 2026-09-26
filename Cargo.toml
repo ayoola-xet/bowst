@@ -14,6 +14,7 @@ repository = "https://github.com/ayoola-xet/bowst"
 bowst-book = { path = "crates/bowst-book" }
 bowst-core = { path = "crates/bowst-core" }
 bowst-journal = { path = "crates/bowst-journal" }
+bowst-telemetry = { path = "crates/bowst-telemetry" }
 bowst-venue = { path = "crates/bowst-venue" }
 
 crc32fast = "1"
