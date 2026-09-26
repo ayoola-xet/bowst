@@ -12,6 +12,7 @@ repository.workspace = true
 bowst-book.workspace = true
 bowst-core.workspace = true
 bowst-journal.workspace = true
+bowst-telemetry.workspace = true
 bowst-venue.workspace = true
 
 [lints]

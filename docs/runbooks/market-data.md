@@ -8,7 +8,7 @@ Applies to the Binance Spot market-data session (`bowst_venue::binance::md`) and
 cargo run --release -p bowst-md -- --symbols BTCUSDT,ETHUSDT --seconds 60
 ```
 
-Healthy output: every symbol `LIVE`, a spread of at least 1 tick (never 0 or negative), steady updates per second, and a summary with `0 book invalidations` and `1 connections`.
+Healthy output: every symbol `LIVE`, a spread of at least 1 tick (never 0 or negative), steady updates per second, a `[stats]` line every 10 seconds, and a summary with `0 book invalidations`, `1 connections` and `0 mismatched` verifications.
 
 ## `InstrumentDown` (one instrument)
 
@@ -19,11 +19,27 @@ Healthy output: every symbol `LIVE`, a spread of at least 1 tick (never 0 or neg
 | `sequence gap` | A diff-depth message was lost (network, venue, or our own buffer) | Automatic: a new snapshot is fetched, usually within 1 to 2 seconds |
 | `crossed book` | Best bid at or above best ask after an update, which means lost or misapplied data | Automatic resync. **Repeated crossings are a bug**: capture logs and escalate |
 | `invalid ...` / `duplicate ...` | The venue sent data that fails validation | Automatic resync. If it repeats, the venue changed its format: escalate |
+| `book differs from a fresh snapshot ...` | Verification rebuilt the book from a fresh snapshot and it did not match ours, although every sequence check passed | Automatic resync. **Always escalate**: see below |
 
 **First five minutes:**
 1. Check whether it recovers (`InstrumentLive` for the same instrument within about 5 seconds).
 2. If it flaps (down and up repeatedly), check `SnapshotFailed` messages and the host's network.
 3. If only one instrument flaps, check the venue's status page for that symbol (maintenance, delisting).
+
+## Verification mismatch (`book differs from a fresh snapshot`)
+
+**Meaning:** once a minute, one instrument's book (in turn) is rebuilt from a fresh REST snapshot plus the same deltas, and the top 100 levels per side are compared with the live book (ADR 0010). A difference means our book was wrong without any gap being visible: a decoding or book bug, or the venue sending inconsistent data. The book is taken down and resynchronized, so quoting stops on that instrument until it is live again.
+
+**What to do:**
+1. Confirm it recovered (`live` for the same instrument).
+2. Keep the journal. The status text names the side, level and update ID, and `bowst-md --replay` reproduces the exact event.
+3. Escalate with the journal and the status line. A single mismatch is a correctness incident even if it recovered.
+
+## `[stats]` lines
+
+Every 10 seconds: messages in the interval, decode-and-apply latency (p50, p99, p99.9 and max of the time to decode one message and apply it to its book), and cumulative verification counts (`ok`, `mismatched`, `abandoned`). `abandoned` means a verification produced no verdict: the snapshot failed, was older than the buffered deltas, or the connection reset. An occasional one is harmless; a steady rise means snapshots are failing (see below).
+
+Latency depends on message size: Binance batches 100 ms of changes into each message, and the cost is roughly proportional to the number of changed levels. Numbers from a shared or sleeping machine (like `bowst-md`, which sleeps when idle) are higher than on an isolated, busy-polling core.
 
 ## `SnapshotFailed`
 
@@ -50,4 +66,4 @@ Healthy output: every symbol `LIVE`, a spread of at least 1 tick (never 0 or neg
 
 ## Configuration reference
 
-Defaults are set in `MdConfig::new`: 1,000-level snapshots, `stale_after` 60 s, `max_connection_age` 23 h, backoff from 250 ms to 30 s, 1,200 REST weight per minute (Binance allows 6,000 per IP).
+Defaults are set in `MdConfig::new`: 1,000-level snapshots, `stale_after` 60 s, `max_connection_age` 23 h, backoff from 250 ms to 30 s, 1,200 REST weight per minute (Binance allows 6,000 per IP), verification every 60 s (abandoned after 30 s without a verdict), and a report every 10 s.

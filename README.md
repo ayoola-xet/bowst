@@ -1,6 +1,6 @@
 # Bowst — Multi-Venue Market Maker
 
-**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009). Remaining for Phase 1: telemetry and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
+**Status:** Phase 0 complete. Phase 1 (market data) in progress: the live market-data path is built (order books, Binance Spot decoding, WebSocket/TLS transport and the market-data session in `crates/bowst-venue`, plus the `bin/bowst-md` tool), with the event journal and exact market-data replay (`crates/bowst-journal`, ADR 0009), and continuous book verification against fresh snapshots plus decode-and-apply latency histograms (`crates/bowst-telemetry`, ADR 0010). Remaining for Phase 1: Prometheus export, the decision on the latency target (see §15), and the 72-hour soak run ([deployment guide](docs/deploy/soak-test.md)). No trading code yet.
 
 Bowst is a low-latency, multi-venue market-making engine. It keeps two-sided quotes on one or more trading venues, controls inventory, and enforces hard risk limits on every order before it leaves the process. It is being built to trade real capital, so correctness and risk control come before speed. Speed is the second priority, and a close one.
 
@@ -145,7 +145,7 @@ These are enforced in code review and by tests (§10.5).
 | `bowst-journal` | Append-only binary event log: checksummed, rotated segment files written by a background thread from a lock-free byte ring (ADR 0009). Every inbound and outbound event is recorded. | Drives deterministic replay and post-mortems. Never silently incomplete: drops are marked and the journal's health gates trading. |
 | `bowst-sim` | Exchange simulator: matching engine with queue position, latency injection and venue-specific quirks. | Used for backtests, integration tests and chaos tests. |
 | `bowst-control` | Authenticated control API (gRPC or HTTPS with mTLS) plus the `bowstctl` CLI. | Kill switch, pause/resume per instrument, parameter updates, status. |
-| `bowst-telemetry` | Metrics (Prometheus), structured logs, latency histograms (HDR). | All off the hot path. |
+| `bowst-telemetry` | Latency histograms (log-linear, allocation-free recording, integer percentiles) today; metrics (Prometheus) and structured logs next. | Only recording touches the hot path; summaries and export are off it. |
 | `bowst` (bin) | Wires everything together from config. Handles startup and shutdown sequencing. | |
 
 ---
@@ -395,6 +395,8 @@ Each phase has exit criteria. A phase is not done until its criteria are met and
 | **7. Bybit Spot** | Bybit adapter on the shared plumbing, cross-venue fair value, global inventory limits, cross-venue rebalancing. | Bybit repeats phases 1–6 in reduced form. The adapter should need little new plumbing code; if it does, the shared layer is fixed first. | 4–6 wk |
 | **7b. Similar venues** | Further spot exchanges (for example OKX), one at a time. | Same as Phase 7. | ongoing |
 | **8. Performance hardening** | Kernel bypass, binary protocols, profile-guided optimization, where measurements justify it. | Measured improvement in live fill quality, not just benchmarks. | ongoing |
+
+**Open: the Phase 1 latency target.** Measured on recorded Binance traffic (ADR 0010), decode plus book update costs about 175 ns per changed level. Binance batches 100 ms of changes per message, about 140 levels at p99, so the p99 per message is about 25 µs, not 5 µs. Meeting the target as written needs roughly a fivefold cut in per-level cost. The options are to optimize (decoding and deep-level book updates are the two halves), to restate the target per level or as time to a correct top of book, or both. This needs a decision before Phase 1 closes.
 
 The earliest realistic date for **meaningful live capital is about 4–5 months** from the start of Phase 0. Skipping the validation phases is how market makers lose money quickly.
 
