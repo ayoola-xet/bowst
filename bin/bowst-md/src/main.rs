@@ -440,3 +440,115 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use bowst_book::SyncConfig;
+    use bowst_core::{Dec, Increment, MonoTime, VenueId};
+    use bowst_journal::format::RecordHeader;
+    use bowst_venue::binance::replay::{BookSizing, describe};
+
+    fn instrument(id: u32, symbol: &str) -> Instrument {
+        Instrument {
+            id: InstrumentId::new(id),
+            venue: VenueId::Binance,
+            symbol: Symbol::new(symbol).unwrap(),
+            tick: Increment::parse("0.01").unwrap(),
+            lot: Increment::parse("0.00001").unwrap(),
+            min_notional: Dec::parse("5").unwrap(),
+        }
+    }
+
+    fn table(symbols: &[&str]) -> InstrumentTable {
+        InstrumentTable::new(
+            symbols
+                .iter()
+                .enumerate()
+                .map(|(i, s)| instrument(u32::try_from(i).unwrap(), s))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// Writes one session-start record per table into a fresh journal directory.
+    fn journal(name: &str, sessions: &[InstrumentTable]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bowst-md-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sizing = BookSizing {
+            sync: SyncConfig {
+                levels_per_side: 10,
+                buffered_messages: 10,
+                buffered_updates: 10,
+            },
+            max_levels_per_message: 10,
+            snapshot_limit: 10,
+        };
+        for session in sessions {
+            let (mut producer, handle) =
+                bowst_journal::start(bowst_journal::JournalConfig::new(&dir)).unwrap();
+            let header = RecordHeader {
+                kind: Kind::SESSION_START,
+                source: 1,
+                mono: MonoTime::from_nanos(1),
+                wall: WallTime::from_nanos(1),
+            };
+            assert!(producer.append(header, &[describe(&sizing, session).as_bytes()]));
+            drop(producer);
+            handle.finish().unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn board_line_shows_decimal_prices_and_quantities() {
+        let top = Top {
+            bid: Some((Price::new(8_475_800), Qty::new(438_837))),
+            ask: Some((Price::new(8_475_801), Qty::new(13_276))),
+            depth: (1_185, 943),
+            updates: 159,
+            event_time: WallTime::from_nanos(0),
+        };
+        let line = board_line(&instrument(0, "BTCUSDT"), &top, true, "159 updates");
+        assert!(
+            line.starts_with("BTCUSDT    LIVE  bid 4.38837 @ 84758.00"),
+            "{line}"
+        );
+        assert!(line.contains("ask 0.13276 @ 84758.01"), "{line}");
+        assert!(
+            line.contains("spread    1 ticks  depth 1185/943  159 updates"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn replay_labels_come_from_the_journal() {
+        let dir = journal(
+            "labels",
+            &[
+                table(&["BTCUSDT", "ETHUSDT"]),
+                table(&["BTCUSDT", "ETHUSDT"]),
+            ],
+        );
+        let found = journal_instruments(&dir).unwrap().unwrap();
+        let symbols: Vec<_> = found.iter().map(|i| i.symbol.as_str().to_owned()).collect();
+        assert_eq!(symbols, ["BTCUSDT", "ETHUSDT"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journal_mixing_instrument_sets_is_rejected() {
+        let dir = journal("mixed", &[table(&["BTCUSDT"]), table(&["SOLUSDT"])]);
+        assert!(journal_instruments(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_journal_has_no_instruments() {
+        let dir = journal("empty", &[]);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(journal_instruments(&dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
