@@ -20,6 +20,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,8 +28,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bowst_book::Book;
-use bowst_core::{InstrumentId, InstrumentTable, Price, Qty, Symbol, WallTime};
+use bowst_core::{Instrument, InstrumentId, InstrumentTable, Price, Qty, Symbol, WallTime};
+use bowst_journal::JournalReader;
+use bowst_journal::format::Kind;
 use bowst_venue::binance::md::{MdConfig, MdHandler, MdSession, MdStatus};
+use bowst_venue::binance::replay::parse_description;
 use bowst_venue::binance::rest::load_instruments;
 use bowst_venue::net::TlsConfig;
 
@@ -40,8 +44,8 @@ struct Args {
     seconds: u64,
     stream: String,
     rest: String,
-    journal: Option<std::path::PathBuf>,
-    replay: Option<std::path::PathBuf>,
+    journal: Option<PathBuf>,
+    replay: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -157,6 +161,35 @@ impl MdHandler for Recorder {
     }
 }
 
+/// One board line: best bid and ask in decimal units, spread, depth and the given rate text.
+fn board_line(instrument: &Instrument, top: &Top, live: bool, rate: &str) -> String {
+    let side = |level: Option<(Price, Qty)>| {
+        level.map_or_else(
+            || "-".to_owned(),
+            |(p, q)| {
+                format!(
+                    "{} @ {}",
+                    q.to_dec(instrument.lot),
+                    p.to_dec(instrument.tick)
+                )
+            },
+        )
+    };
+    let spread = match (top.bid, top.ask) {
+        (Some((bid, _)), Some((ask, _))) => ask.checked_sub(bid).map_or(0, Price::get),
+        _ => 0,
+    };
+    format!(
+        "{:<10} {:<5} bid {:<28} ask {:<28} spread {spread:>4} ticks  depth {}/{}  {rate}",
+        instrument.symbol.as_str(),
+        if live { "LIVE" } else { "down" },
+        side(top.bid),
+        side(top.ask),
+        top.depth.0,
+        top.depth.1,
+    )
+}
+
 fn print_board(board: &Board, instruments: &InstrumentTable, previous: &mut BTreeMap<u32, u64>) {
     for instrument in instruments.iter() {
         let id = instrument.id.get();
@@ -165,37 +198,57 @@ fn print_board(board: &Board, instruments: &InstrumentTable, previous: &mut BTre
             .updates
             .saturating_sub(previous.insert(id, top.updates).unwrap_or(0));
         let live = board.live.get(&id).copied().unwrap_or(false);
-        let side = |level: Option<(Price, Qty)>| {
-            level.map_or_else(
-                || "-".to_owned(),
-                |(p, q)| {
-                    format!(
-                        "{} @ {}",
-                        q.to_dec(instrument.lot),
-                        p.to_dec(instrument.tick)
-                    )
-                },
-            )
-        };
-        let spread = match (top.bid, top.ask) {
-            (Some((bid, _)), Some((ask, _))) => ask.checked_sub(bid).map_or(0, Price::get),
-            _ => 0,
-        };
         println!(
-            "{:<10} {:<5} bid {:<28} ask {:<28} spread {spread:>4} ticks  depth {}/{}  {rate:>3} upd/s",
-            instrument.symbol.as_str(),
-            if live { "LIVE" } else { "down" },
-            side(top.bid),
-            side(top.ask),
-            top.depth.0,
-            top.depth.1,
+            "{}",
+            board_line(instrument, &top, live, &format!("{rate:>3} upd/s"))
         );
     }
 }
 
+/// The instruments of the journal's sessions, from their session-start records. `None` if the
+/// journal holds no session. Every session must describe the same instruments, so one set of
+/// labels is right for the whole replay.
+fn journal_instruments(dir: &Path) -> Result<Option<InstrumentTable>, String> {
+    let mut reader = JournalReader::open(dir).map_err(|e| e.to_string())?;
+    let mut found: Option<InstrumentTable> = None;
+    while let Some(record) = reader.next_record().map_err(|e| e.to_string())? {
+        if record.header.kind != Kind::SESSION_START {
+            continue;
+        }
+        let text = String::from_utf8_lossy(record.payload);
+        let (_, table) = parse_description(&text).map_err(|e| e.to_string())?;
+        match &found {
+            Some(first) if !same_instruments(first, &table) => {
+                return Err(
+                    "its sessions describe different instruments; replay each run's journal separately"
+                        .into(),
+                );
+            }
+            Some(_) => {}
+            None => found = Some(table),
+        }
+    }
+    Ok(found)
+}
+
+fn same_instruments(a: &InstrumentTable, b: &InstrumentTable) -> bool {
+    a.iter().len() == b.iter().len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
 /// Replays a journal and prints the final books.
-fn replay_journal(dir: &std::path::Path) -> ExitCode {
-    let mut reader = match bowst_journal::JournalReader::open(dir) {
+fn replay_journal(dir: &Path) -> ExitCode {
+    let instruments = match journal_instruments(dir) {
+        Ok(Some(instruments)) => instruments,
+        Ok(None) => {
+            eprintln!("the journal holds no session");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("cannot replay journal: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut reader = match JournalReader::open(dir) {
         Ok(reader) => reader,
         Err(e) => {
             eprintln!("cannot open journal: {e}");
@@ -203,10 +256,9 @@ fn replay_journal(dir: &std::path::Path) -> ExitCode {
         }
     };
     let board = Arc::new(Mutex::new(Board::default()));
-    // The journal names its instruments; symbols here only label status lines.
     let mut recorder = Recorder {
         board: Arc::clone(&board),
-        symbols: Vec::new(),
+        symbols: instruments.iter().map(|i| i.symbol).collect(),
     };
     let report = match bowst_venue::binance::replay::replay(&mut reader, &mut recorder) {
         Ok(report) => report,
@@ -229,14 +281,13 @@ fn replay_journal(dir: &std::path::Path) -> ExitCode {
         }
     );
     if let Ok(board) = board.lock() {
-        for (id, top) in &board.tops {
+        for instrument in instruments.iter() {
+            let id = instrument.id.get();
+            let top = board.tops.get(&id).copied().unwrap_or_default();
+            let live = board.live.get(&id).copied().unwrap_or(false);
             println!(
-                "instrument #{id}: bid {:?} ask {:?} depth {}/{} after {} updates",
-                top.bid.map(|(p, q)| (p.get(), q.get())),
-                top.ask.map(|(p, q)| (p.get(), q.get())),
-                top.depth.0,
-                top.depth.1,
-                top.updates
+                "{}",
+                board_line(instrument, &top, live, &format!("{} updates", top.updates))
             );
         }
     }
