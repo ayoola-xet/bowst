@@ -6,9 +6,10 @@ use bowst_core::{Increment, Price, Qty, Rounding, Side};
 use crate::DecodeError;
 use crate::json::Reader;
 
-fn exact(text: &str, increment: Increment, field: &'static str) -> Result<i64, DecodeError> {
+#[inline]
+fn exact(text: &[u8], increment: Increment, field: &'static str) -> Result<i64, DecodeError> {
     increment
-        .parse_units(text, Rounding::Exact)
+        .parse_units_bytes(text, Rounding::Exact)
         .map_err(|error| DecodeError::InvalidNumber { field, error })
 }
 
@@ -17,6 +18,7 @@ fn exact(text: &str, increment: Increment, field: &'static str) -> Result<i64, D
 /// # Errors
 /// On malformed JSON, a pair that is not exactly two strings, or a value that is not a whole
 /// number of the instrument's increments.
+#[inline]
 pub fn read_level(
     r: &mut Reader<'_>,
     tick: Increment,
@@ -26,11 +28,11 @@ pub fn read_level(
     if !r.next_element()? {
         return Err(DecodeError::UnexpectedValue("level"));
     }
-    let price = Price::new(exact(r.str()?, tick, "price")?);
+    let price = Price::new(exact(r.str_bytes()?, tick, "price")?);
     if !r.next_element()? {
         return Err(DecodeError::UnexpectedValue("level"));
     }
-    let qty = Qty::new(exact(r.str()?, lot, "qty")?);
+    let qty = Qty::new(exact(r.str_bytes()?, lot, "qty")?);
     if r.next_element()? {
         return Err(DecodeError::UnexpectedValue("level"));
     }
