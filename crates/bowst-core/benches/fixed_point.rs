@@ -25,6 +25,13 @@ fn fixed_point(c: &mut Criterion) {
             tick.to_units(dec, Rounding::Exact)
         });
     });
+    let lot = Increment::parse("0.00001").unwrap();
+    c.bench_function("fixed/parse_units_price", |b| {
+        b.iter(|| black_box(tick).parse_units(black_box("43251.37000000"), Rounding::Exact));
+    });
+    c.bench_function("fixed/parse_units_qty", |b| {
+        b.iter(|| black_box(lot).parse_units(black_box("5.01777000"), Rounding::Exact));
+    });
     c.bench_function("fixed/format_price", |b| {
         let mut buf = [0_u8; MAX_TEXT_LEN];
         b.iter(|| black_box(price).write_to(&mut buf));

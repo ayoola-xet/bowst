@@ -17,6 +17,10 @@ pub const MAX_SCALE: u8 = 36;
 /// Largest number of decimal places accepted when parsing text or building an [`Increment`].
 pub const MAX_PARSE_SCALE: u8 = 18;
 
+/// Digits the fast path of [`Increment::parse_units`] accumulates before deferring to the
+/// general path. `10^18 - 1` fits in an `i64` (and a `u64`) with room to spare.
+const FAST_DIGITS: usize = 18;
+
 /// Longest text [`Dec::write_to`] can produce: sign, 39 digits, decimal point, leading zero.
 pub const MAX_TEXT_LEN: usize = 42;
 
@@ -172,7 +176,16 @@ impl Dec {
     /// [`FixedError::Empty`], [`FixedError::InvalidChar`], [`FixedError::TooManyDecimals`] or
     /// [`FixedError::Overflow`].
     pub fn parse(text: &str) -> Result<Self, FixedError> {
-        let bytes = text.as_bytes();
+        Self::parse_bytes(text.as_bytes())
+    }
+
+    /// [`parse`](Self::parse) for raw bytes, such as a string borrowed from a network buffer.
+    /// Any byte outside the accepted form, including every non-ASCII byte, is an
+    /// [`FixedError::InvalidChar`], so no UTF-8 validation is needed first.
+    ///
+    /// # Errors
+    /// As [`parse`](Self::parse).
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, FixedError> {
         let (negative, digits_start) = match bytes.first() {
             None => return Err(FixedError::Empty),
             Some(b'-') => (true, 1),
@@ -467,20 +480,33 @@ impl Increment {
     /// # Errors
     /// As [`Dec::parse`] and [`Increment::to_units`].
     pub fn parse_units(self, text: &str, rounding: Rounding) -> Result<i64, FixedError> {
-        if let Some(units) = self.parse_exact_power_of_ten(text) {
+        self.parse_units_bytes(text.as_bytes(), rounding)
+    }
+
+    /// [`parse_units`](Self::parse_units) for raw bytes: same results and errors, with no
+    /// UTF-8 validation needed first (see [`Dec::parse_bytes`]).
+    ///
+    /// # Errors
+    /// As [`parse_units`](Self::parse_units).
+    #[inline]
+    pub fn parse_units_bytes(self, bytes: &[u8], rounding: Rounding) -> Result<i64, FixedError> {
+        if let Some(units) = self.parse_exact_power_of_ten(bytes) {
             return Ok(units);
         }
-        self.to_units(Dec::parse(text)?, rounding)
+        self.to_units(Dec::parse_bytes(bytes)?, rounding)
     }
 
     /// The division-free fast path of [`parse_units`](Self::parse_units). `None` means "not
-    /// handled here", never an error.
-    fn parse_exact_power_of_ten(self, text: &str) -> Option<i64> {
+    /// handled here", never an error: anything unusual goes to the general path, which
+    /// produces the result or the error.
+    ///
+    /// The digit count is checked once up front (at most [`FAST_DIGITS`]), so the digit loops
+    /// need no overflow checks.
+    #[inline]
+    fn parse_exact_power_of_ten(self, bytes: &[u8]) -> Option<i64> {
         if self.mantissa != 1 {
             return None;
         }
-        // Work on bytes: splitting a `str` inside a multi-byte character would panic.
-        let bytes = text.as_bytes();
         let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
             Some(dot) => {
                 let (int, rest) = bytes.split_at(dot);
@@ -492,25 +518,30 @@ impl Increment {
             }
             None => (bytes, &[][..]),
         };
-        let wanted = usize::from(self.scale);
         if int_part.is_empty() || frac_part.len() > usize::from(MAX_PARSE_SCALE) {
             return None;
         }
+        let wanted = usize::from(self.scale);
         let (kept, dropped) = frac_part.split_at(frac_part.len().min(wanted));
         if !dropped.iter().all(|&b| b == b'0') {
             return None; // Not an exact multiple (or malformed): let the general path decide.
         }
-        let mut units: i64 = 0;
+        if int_part.len().saturating_add(kept.len()) > FAST_DIGITS {
+            return None;
+        }
+        let mut units: u64 = 0;
         for &byte in int_part.iter().chain(kept) {
-            if !byte.is_ascii_digit() {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
                 return None;
             }
-            units = units
-                .checked_mul(10)?
-                .checked_add(i64::from(byte.wrapping_sub(b'0')))?;
+            // At most `FAST_DIGITS` (18) digits: below 10^18, so this cannot wrap.
+            units = units.wrapping_mul(10).wrapping_add(u64::from(digit));
         }
         let missing = wanted.saturating_sub(kept.len());
-        units.checked_mul(*POW10_I64.get(missing)?)
+        i64::try_from(units)
+            .ok()?
+            .checked_mul(*POW10_I64.get(missing)?)
     }
 
     /// The decimal value of `units` whole increments. Always exact.
@@ -647,6 +678,13 @@ mod tests {
             "",
             "99999999999999999999.00",
             "0.0000000000000000000",
+            "999999999999999999.99",
+            "92233720368547758.07",
+            "92233720368547758.08",
+            "1.2.3",
+            "..",
+            "5.00000000000000000000",
+            "0000000000000000001.00",
         ] {
             let general = Dec::parse(text).and_then(|d| tick.to_units(d, Rounding::Exact));
             assert_eq!(tick.parse_units(text, Rounding::Exact), general, "{text:?}");
@@ -728,6 +766,25 @@ mod tests {
             let inc = Increment::new(1, scale).unwrap();
             let general = Dec::parse(&text).and_then(|d| inc.to_units(d, rounding));
             prop_assert_eq!(inc.parse_units(&text, rounding), general);
+        }
+
+        #[test]
+        fn parse_units_bytes_matches_general_path_on_any_bytes(
+            bytes in proptest::collection::vec(prop_oneof![
+                4 => proptest::char::range('0', '9').prop_map(|c| u8::try_from(c).unwrap()),
+                1 => Just(b'.'),
+                1 => Just(b'-'),
+                1 => any::<u8>(),
+            ], 0..28),
+            scale in 0_u8..=8,
+            rounding in prop_oneof![Just(Rounding::Down), Just(Rounding::Up), Just(Rounding::Exact)],
+        ) {
+            let inc = Increment::new(1, scale).unwrap();
+            let general = Dec::parse_bytes(&bytes).and_then(|d| inc.to_units(d, rounding));
+            prop_assert_eq!(inc.parse_units_bytes(&bytes, rounding), general);
+            if let Ok(text) = core::str::from_utf8(&bytes) {
+                prop_assert_eq!(Dec::parse(text), Dec::parse_bytes(&bytes));
+            }
         }
 
         #[test]
